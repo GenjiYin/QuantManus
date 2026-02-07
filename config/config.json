@@ -1,0 +1,22 @@
+{
+  "llm": {
+    "model": "kimi-k2-turbo-preview",
+    "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxx",
+    "base_url": "https://api.moonshot.cn/v1",
+    "temperature": 0.7,
+    "max_tokens": 4096
+  },
+  "workspace": {
+    "root_dir": "./workspace",
+    "max_file_size": 1048576
+  },
+  "agent": {
+    "max_steps": 20,
+    "max_retry": 3
+  },
+  "logging": {
+    "level": "INFO",
+    "log_file": null,
+    "use_color": true
+  }
+}

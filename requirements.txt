@@ -1,0 +1,14 @@
+# QuantManus 依赖列表
+
+# 核心依赖
+openai>=1.0.0        # OpenAI API客户端,支持function calling
+tiktoken>=0.5.0      # Token计数库(记忆管理必需)
+
+# 日志和配置
+colorlog>=6.7.0      # 彩色日志输出
+
+# 可选依赖(根据需要安装)
+# requests>=2.31.0   # 如果需要网络请求功能
+# pandas>=2.0.0      # 如果需要数据分析功能
+# numpy>=1.24.0      # 如果需要数值计算功能
+# matplotlib>=3.7.0  # 如果需要数据可视化功能
