@@ -409,6 +409,7 @@ class MemoryManager:
         tool_call_ids_in_assistant = set()  # assistant消息中的tool_call_id
         tool_call_ids_in_tool = set()  # tool消息中的tool_call_id
 
+        # 第一遍：收集所有的tool_call_id
         for memory_item, _, _ in temp_messages:
             if memory_item.role == "assistant" and "tool_calls" in memory_item.metadata:
                 for tc in memory_item.metadata.get("tool_calls", []):
@@ -421,38 +422,52 @@ class MemoryManager:
                 if tc_id:
                     tool_call_ids_in_tool.add(tc_id)
 
-        # 过滤：只保留完整的消息
-        # - tool消息：必须有对应的assistant tool_calls
-        # - assistant tool_calls消息：可以没有对应的tool消息（可能还在执行中）
+        # 找出孤立的tool_call（有assistant调用但没有tool响应，或有tool响应但没有assistant调用）
+        orphaned_assistant_calls = tool_call_ids_in_assistant - tool_call_ids_in_tool
+        orphaned_tool_responses = tool_call_ids_in_tool - tool_call_ids_in_assistant
+
+        # 过滤：确保工具调用的完整性
+        # 策略：优先保留完整的调用对，如果不完整则全部移除以避免API错误
         working_messages = []
         for memory_item, msg_dict, _ in temp_messages:
-            # tool消息：必须有对应的tool_calls
+            # tool消息：必须有对应的assistant tool_calls
             if memory_item.role == "tool":
                 tc_id = memory_item.metadata.get("tool_call_id")
-                if tc_id and tc_id in tool_call_ids_in_assistant:
-                    working_messages.append(msg_dict)
-                # 否则跳过这条孤立的tool消息
+                if tc_id:
+                    # 只保留有对应assistant调用的tool响应
+                    if tc_id in tool_call_ids_in_assistant:
+                        working_messages.append(msg_dict)
+                    # 否则跳过孤立的tool消息
+                else:
+                    # tool_call_id为空，这是个问题，直接跳过
+                    pass
 
-            # assistant消息包含tool_calls：检查是否有孤立的tool_call
+            # assistant消息包含tool_calls：只保留有对应tool响应的调用
             elif memory_item.role == "assistant" and "tool_calls" in memory_item.metadata:
-                # 创建新的tool_calls列表，只包含有对应tool消息的调用
+                # 过滤tool_calls，只保留有对应tool响应的
                 valid_tool_calls = []
                 for tc in memory_item.metadata.get("tool_calls", []):
                     tc_id = tc.get("id")
-                    # 如果这个tool_call_id有对应的tool消息，或者后续可能有，都保留
-                    # 简化处理：全部保留，因为可能工具还在执行中
-                    valid_tool_calls.append(tc)
+                    if tc_id and tc_id in tool_call_ids_in_tool:
+                        # 有对应的tool响应，保留
+                        valid_tool_calls.append(tc)
+                    # 否则跳过（没有对应的tool响应会导致API错误）
 
+                # 构建消息
                 if valid_tool_calls:
-                    # 更新msg_dict的tool_calls
+                    # 有有效的tool_calls，构建包含tool_calls的消息
                     msg_dict_copy = msg_dict.copy()
                     msg_dict_copy["tool_calls"] = valid_tool_calls
+                    # 如果原消息没有content，设置为None（符合API要求）
+                    if not msg_dict_copy.get("content"):
+                        msg_dict_copy["content"] = None
                     working_messages.append(msg_dict_copy)
                 elif msg_dict.get("content"):
-                    # 如果没有有效的tool_calls但有content，作为普通消息保留
+                    # 没有有效的tool_calls但有content，作为普通assistant消息保留
                     msg_dict_copy = msg_dict.copy()
                     msg_dict_copy.pop("tool_calls", None)
                     working_messages.append(msg_dict_copy)
+                # 否则完全跳过（既没有有效tool_calls也没有content）
 
             # 其他消息：直接包含
             else:
@@ -590,7 +605,11 @@ class MemoryManager:
         # 添加元数据中的其他字段
         for key in ["tool_calls", "tool_call_id", "name"]:
             if key in item.metadata:
-                msg[key] = item.metadata[key]
+                value = item.metadata[key]
+                # 验证tool_call_id不为空
+                if key == "tool_call_id" and (not value or value.strip() == ""):
+                    continue  # 跳过空的tool_call_id
+                msg[key] = value
 
         return msg
 

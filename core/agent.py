@@ -305,9 +305,14 @@ class SimpleAgent:
         import json
 
         for tool_call in tool_calls:
-            tool_id = tool_call["id"]
+            tool_id = tool_call.get("id", "")
             tool_name = tool_call["function"]["name"]
             tool_args_str = tool_call["function"]["arguments"]
+
+            # 验证tool_id不为空
+            if not tool_id or tool_id.strip() == "":
+                self.logger.error(f"工具调用缺少有效的ID: {tool_call}")
+                continue
 
             self.logger.info(f"\n调用工具: {tool_name}")
             self.logger.debug(f"参数: {tool_args_str}")

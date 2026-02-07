@@ -9,16 +9,18 @@ from .planner import Plan, Step, StepStatus
 class PlanExecutor:
     """计划执行器 - 按步骤执行计划"""
 
-    def __init__(self, agent, logger=None):
+    def __init__(self, agent, logger=None, enable_dynamic_planning=True):
         """
         初始化计划执行器
 
         Args:
             agent: SimpleAgent实例
             logger: 日志记录器
+            enable_dynamic_planning: 是否启用动态规划（反思机制）
         """
         self.agent = agent
         self.logger = logger
+        self.enable_dynamic_planning = enable_dynamic_planning
 
     def execute_plan(self, plan: Plan, max_retries: int = 2) -> Dict[str, Any]:
         """
@@ -117,7 +119,7 @@ class PlanExecutor:
                 # 使用agent执行
                 result = self.agent.execute_subtask(
                     task=execution_prompt,
-                    max_steps=5  # 限制子任务的最大步骤数
+                    max_steps=15  # 子任务的最大步骤数（从5增加到15，避免复杂任务被过早终止）
                 )
 
                 # 记录结果
@@ -129,6 +131,16 @@ class PlanExecutor:
                     print(f"✅ 步骤 {step.id} 执行成功")
                     result_preview = result[:200] + "..." if len(result) > 200 else result
                     print(f"结果: {result_preview}")
+
+                # 反思机制：根据执行结果动态调整计划
+                if self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
+                    new_steps = self.agent.planner.reflect_and_adjust_plan(plan, step)
+                    if new_steps:
+                        # 将新步骤插入到计划中
+                        for new_step in new_steps:
+                            plan.add_step(new_step)
+                            if self.logger:
+                                self.logger.info(f"📌 已添加新步骤: {new_step.id} - {new_step.description}")
 
                 break  # 成功则退出重试循环
 

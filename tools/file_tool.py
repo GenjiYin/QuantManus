@@ -143,15 +143,17 @@ class ListDirectoryTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="list_directory",
-            description="列出指定目录下的所有文件和子目录"
+            description="列出指定目录下的所有文件和子目录。可选择是否递归列出所有子目录的内容。"
         )
 
-    def execute(self, directory_path: str) -> ToolResult:
+    def execute(self, directory_path: str, recursive: bool = False, max_depth: int = 3) -> ToolResult:
         """
         列出目录内容
 
         参数:
             directory_path: 目录路径
+            recursive: 是否递归列出子目录内容（默认False）
+            max_depth: 递归的最大深度（默认3层，防止过深）
 
         返回:
             ToolResult: 包含目录内容列表或错误信息
@@ -174,12 +176,10 @@ class ListDirectoryTool(BaseTool):
                 )
 
             # 列出目录内容
-            items = []
-            for item in path.iterdir():
-                item_type = "目录" if item.is_dir() else "文件"
-                items.append(f"[{item_type}] {item.name}")
-
-            output = "\n".join(items) if items else "目录为空"
+            if recursive:
+                output = self._list_recursive(path, max_depth=max_depth)
+            else:
+                output = self._list_single_level(path)
 
             return ToolResult(
                 success=True,
@@ -192,6 +192,72 @@ class ListDirectoryTool(BaseTool):
                 error=f"列出目录失败: {str(e)}"
             )
 
+    def _list_single_level(self, path: Path) -> str:
+        """列出单层目录内容"""
+        items = []
+        files = []
+        dirs = []
+
+        for item in sorted(path.iterdir()):
+            if item.is_dir():
+                # 使用完整绝对路径，方便AI后续使用
+                dirs.append(f"📁 [目录] {item.name}\n   完整路径: {item.absolute()}")
+            else:
+                # 显示文件大小
+                size = item.stat().st_size
+                size_str = self._format_size(size)
+                files.append(f"📄 [文件] {item.name} ({size_str})\n   完整路径: {item.absolute()}")
+
+        # 先显示目录，再显示文件
+        items = dirs + files
+
+        if not items:
+            return f"目录为空: {path}"
+
+        header = f"目录: {path.absolute()}\n" + "=" * 60 + "\n"
+        summary = f"\n" + "-" * 60 + f"\n共 {len(dirs)} 个子目录, {len(files)} 个文件\n\n💡 提示：使用上面的'完整路径'来访问文件或子目录"
+
+        return header + "\n".join(items) + summary
+
+    def _list_recursive(self, path: Path, max_depth: int, current_depth: int = 0, prefix: str = "") -> str:
+        """递归列出目录内容"""
+        if current_depth > max_depth:
+            return f"{prefix}[已达最大深度限制]"
+
+        items = []
+        try:
+            sorted_items = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name))
+
+            for i, item in enumerate(sorted_items):
+                is_last = (i == len(sorted_items) - 1)
+                connector = "└── " if is_last else "├── "
+                next_prefix = prefix + ("    " if is_last else "│   ")
+
+                if item.is_dir():
+                    # 显示目录名和完整路径
+                    items.append(f"{prefix}{connector}📁 {item.name}/ → {item.absolute()}")
+                    # 递归列出子目录
+                    sub_items = self._list_recursive(item, max_depth, current_depth + 1, next_prefix)
+                    if sub_items:
+                        items.append(sub_items)
+                else:
+                    size = item.stat().st_size
+                    size_str = self._format_size(size)
+                    items.append(f"{prefix}{connector}📄 {item.name} ({size_str}) → {item.absolute()}")
+
+        except PermissionError:
+            items.append(f"{prefix}[权限不足]")
+
+        return "\n".join(items)
+
+    def _format_size(self, size: int) -> str:
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f}{unit}"
+            size /= 1024.0
+        return f"{size:.1f}TB"
+
     def get_parameters(self) -> Dict[str, Any]:
         """定义工具参数"""
         return {
@@ -199,7 +265,17 @@ class ListDirectoryTool(BaseTool):
             "properties": {
                 "directory_path": {
                     "type": "string",
-                    "description": "要列出的目录路径"
+                    "description": "要列出的目录路径（绝对路径或相对路径）"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "是否递归列出所有子目录的内容。True=显示目录树结构，False=仅显示当前目录（默认False）",
+                    "default": False
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "递归时的最大深度，防止过深（默认3层）",
+                    "default": 3
                 }
             },
             "required": ["directory_path"]

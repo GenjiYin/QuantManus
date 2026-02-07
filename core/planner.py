@@ -345,3 +345,142 @@ class Planner:
                     }
                 ]
             }
+
+    def reflect_and_adjust_plan(self, plan: Plan, executed_step: Step) -> List[Step]:
+        """
+        反思步骤执行结果，并决定是否需要动态调整计划
+
+        Args:
+            plan: 当前执行计划
+            executed_step: 刚执行完的步骤
+
+        Returns:
+            List[Step]: 需要插入的新步骤列表（如果不需要调整则返回空列表）
+        """
+        if self.logger:
+            self.logger.info(f"正在反思步骤 {executed_step.id} 的执行结果...")
+
+        # 如果步骤执行失败，不进行调整
+        if executed_step.status == StepStatus.FAILED:
+            return []
+
+        # 构建反思提示
+        reflection_prompt = self._build_reflection_prompt(plan, executed_step)
+
+        messages = [
+            {"role": "system", "content": "你是一个专业的任务规划助手，擅长根据执行结果动态调整计划。"},
+            {"role": "user", "content": reflection_prompt}
+        ]
+
+        try:
+            response = self.llm_client.chat(messages=messages)
+            reflection_result = self._parse_reflection_response(response.get("content", ""))
+
+            # 如果需要调整计划
+            if reflection_result.get("need_adjustment", False):
+                new_steps = []
+                next_step_id = max(step.id for step in plan.steps) + 1
+
+                for i, step_data in enumerate(reflection_result.get("new_steps", [])):
+                    step = Step(
+                        id=next_step_id + i,
+                        description=step_data["description"],
+                        goal=step_data["goal"],
+                        tool_name=step_data.get("tool_name"),
+                        tool_args=step_data.get("tool_args"),
+                        dependencies=step_data.get("dependencies", [executed_step.id])
+                    )
+                    new_steps.append(step)
+
+                if new_steps and self.logger:
+                    self.logger.info(f"🔄 根据步骤 {executed_step.id} 的结果，动态添加 {len(new_steps)} 个新步骤")
+                    for step in new_steps:
+                        self.logger.info(f"   - 新步骤 {step.id}: {step.description}")
+
+                return new_steps
+
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"反思过程出错: {str(e)}")
+
+        return []
+
+    def _build_reflection_prompt(self, plan: Plan, executed_step: Step) -> str:
+        """构建反思提示词"""
+        # 获取后续待执行的步骤
+        pending_steps = [s for s in plan.steps if s.status == StepStatus.PENDING]
+        pending_steps_desc = "\n".join([
+            f"- 步骤{s.id}: {s.description}"
+            for s in pending_steps
+        ])
+
+        tools_info = self._get_tools_info()
+
+        return f"""请分析刚执行完的步骤结果，判断是否需要动态调整后续计划。
+
+原始任务：
+{plan.task}
+
+刚执行完的步骤：
+- 步骤ID: {executed_step.id}
+- 描述: {executed_step.description}
+- 目标: {executed_step.goal}
+- 执行结果: {executed_step.result[:500] if executed_step.result else "无"}
+
+后续待执行的步骤：
+{pending_steps_desc if pending_steps_desc else "（无待执行步骤）"}
+
+可用工具：
+{tools_info}
+
+请分析：
+1. 步骤的执行结果中是否包含需要立即处理的新信息或指令？
+2. 是否需要在当前步骤之后插入新的步骤？
+3. 新步骤是否会与现有待执行步骤冲突或重复？
+
+判断规则：
+- 如果执行结果中明确提到"请读取xxx文件"、"需要先处理xxx"等指令，应该插入新步骤
+- 如果执行结果揭示了新的依赖关系或前置条件，应该调整计划
+- 如果执行结果只是正常的数据或确认信息，无需调整
+
+请按以下JSON格式输出（只输出JSON，不要其他内容）：
+
+```json
+{{
+  "need_adjustment": true/false,
+  "reason": "需要/不需要调整的原因",
+  "new_steps": [
+    {{
+      "description": "新步骤描述",
+      "goal": "新步骤目标",
+      "tool_name": "工具名称（可选）",
+      "tool_args": {{"arg": "value"}},
+      "dependencies": [{executed_step.id}]
+    }}
+  ]
+}}
+```"""
+
+    def _parse_reflection_response(self, response: str) -> Dict[str, Any]:
+        """解析反思响应"""
+        try:
+            # 提取JSON
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0].strip()
+            elif "```" in response:
+                json_str = response.split("```")[1].split("```")[0].strip()
+            else:
+                json_str = response.strip()
+
+            result = json.loads(json_str)
+            return result
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"解析反思结果失败: {str(e)}")
+
+            return {
+                "need_adjustment": False,
+                "reason": "解析失败",
+                "new_steps": []
+            }
