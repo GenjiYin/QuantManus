@@ -27,7 +27,7 @@ def create_agent() -> SimpleAgent:
         api_key=llm_config.get("api_key", ""),
         base_url=llm_config.get("base_url", "https://api.openai.com/v1"),
         temperature=llm_config.get("temperature", 0.7),
-        max_tokens=llm_config.get("max_tokens", 4096)
+        max_tokens=llm_config.get("max_tokens")
     )
 
     # 创建工具列表

@@ -32,6 +32,7 @@ class SimpleConfig:
         # 加载配置（文件不存在时用默认值）
         if self.config_path.exists():
             self.config_data = self._load_config()
+            self._migrate_config()
         else:
             self.config_data = self._get_default_config()
 
@@ -61,6 +62,13 @@ class SimpleConfig:
             print(f"加载配置文件失败: {e}")
             return self._get_default_config()
 
+    def _migrate_config(self):
+        """迁移旧配置：将 max_tokens=4096 改为 None（不限制，使用模型默认值）"""
+        llm = self.config_data.get("llm", {})
+        if llm.get("max_tokens") == 4096:
+            llm["max_tokens"] = None
+            self.save()
+
     def _get_default_config(self) -> Dict:
         """
         获取默认配置
@@ -74,7 +82,7 @@ class SimpleConfig:
                 "api_key": "your-api-key-here",
                 "base_url": "https://api.openai.com/v1",
                 "temperature": 0.7,
-                "max_tokens": 4096
+                "max_tokens": None
             },
             "agent": {
                 "max_steps": 20,
