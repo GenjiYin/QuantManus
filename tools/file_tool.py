@@ -99,6 +99,16 @@ class WriteFileTool(BaseTool):
         try:
             path = Path(file_path)
 
+            # 如果文件已存在，请求用户确认覆盖
+            if path.exists():
+                print(f"\n⚠️  文件已存在: {file_path}")
+                confirm = input("是否覆盖该文件？(y/n): ").strip().lower()
+                if confirm != 'y':
+                    return ToolResult(
+                        success=False,
+                        error=f"用户取消了文件覆盖: {file_path}"
+                    )
+
             # 确保父目录存在
             path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -132,6 +142,76 @@ class WriteFileTool(BaseTool):
                 }
             },
             "required": ["file_path", "content"]
+        }
+
+
+class DeleteFileTool(BaseTool):
+    """
+    删除文件工具
+    """
+
+    def __init__(self):
+        super().__init__(
+            name="delete_file",
+            description="删除指定路径的文件，执行前会请求用户确认"
+        )
+
+    def execute(self, file_path: str) -> ToolResult:
+        """
+        删除文件
+
+        参数:
+            file_path: 文件路径
+
+        返回:
+            ToolResult: 执行结果
+        """
+        try:
+            path = Path(file_path)
+
+            if not path.exists():
+                return ToolResult(
+                    success=False,
+                    error=f"文件不存在: {file_path}"
+                )
+
+            if not path.is_file():
+                return ToolResult(
+                    success=False,
+                    error=f"路径不是文件: {file_path}"
+                )
+
+            print(f"\n⚠️  即将删除文件: {file_path}")
+            confirm = input("确认删除？(y/n): ").strip().lower()
+            if confirm != 'y':
+                return ToolResult(
+                    success=False,
+                    error=f"用户取消了文件删除: {file_path}"
+                )
+
+            path.unlink()
+            return ToolResult(
+                success=True,
+                output=f"已删除文件: {file_path}"
+            )
+
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                error=f"删除文件失败: {str(e)}"
+            )
+
+    def get_parameters(self) -> Dict[str, Any]:
+        """定义工具参数"""
+        return {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "要删除的文件路径"
+                }
+            },
+            "required": ["file_path"]
         }
 
 

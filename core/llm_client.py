@@ -3,6 +3,9 @@ LLM客户端
 负责与大语言模型API进行交互
 """
 import json
+import sys
+import threading
+import time
 from typing import List, Dict, Any, Optional
 try:
     from openai import OpenAI
@@ -88,11 +91,36 @@ class LLMClient:
                 request_params["tools"] = tools
                 request_params["tool_choice"] = tool_choice
 
-            # 发送请求
-            response = self.client.chat.completions.create(**request_params)
+            # 发送请求（后台线程实时显示计时）
+            start_time = time.time()
+            stop_event = threading.Event()
+
+            def _show_timer():
+                while not stop_event.is_set():
+                    elapsed = time.time() - start_time
+                    print(f"\r⏱️  等待 LLM 响应: {elapsed:.1f}s ...", end="", flush=True)
+                    stop_event.wait(0.1)
+
+            timer_thread = threading.Thread(target=_show_timer, daemon=True)
+            timer_thread.start()
+
+            try:
+                response = self.client.chat.completions.create(**request_params)
+            finally:
+                stop_event.set()
+                timer_thread.join()
+
+            elapsed = time.time() - start_time
 
             # 提取响应内容
             message = response.choices[0].message
+
+            # 打印耗时 + 内容预览
+            preview = ""
+            if message.content:
+                text = message.content.replace("\n", " ")
+                preview = text[:50] + "..." if len(text) > 50 else text
+            print(f"\r⏱️  LLM 响应完成，耗时: {elapsed:.2f}s | {preview}   ")
 
             result = {
                 "role": message.role,

@@ -200,15 +200,16 @@ class Planner:
         self.tools = tools
         self.logger = logger
 
-    def create_plan(self, task: str) -> Plan:
+    def create_plan(self, task: str, context: str = ""):
         """
-        为任务创建执行计划
+        为任务创建执行计划，或直接回答简单问题
 
         Args:
             task: 任务描述
+            context: 近期对话历史摘要，让 planner 了解上下文
 
         Returns:
-            Plan: 生成的执行计划
+            Plan 对象（需要工具执行时）或 str（可直接回答时）
         """
         if self.logger:
             self.logger.info(f"开始为任务创建计划: {task}")
@@ -217,7 +218,7 @@ class Planner:
         tools_info = self._get_tools_info()
 
         # 构造规划提示词
-        planning_prompt = self._build_planning_prompt(task, tools_info)
+        planning_prompt = self._build_planning_prompt(task, tools_info, context)
 
         # 调用LLM生成计划
         messages = [
@@ -228,6 +229,13 @@ class Planner:
         try:
             response = self.llm_client.chat(messages=messages)
             plan_json = self._parse_plan_response(response.get("content", ""))
+
+            # 如果 planner 判断可以直接回答（无需工具）
+            direct_answer = plan_json.get("direct_answer")
+            if direct_answer and not plan_json.get("steps"):
+                if self.logger:
+                    self.logger.info("Planner 判断无需工具，直接回答")
+                return direct_answer
 
             # 创建Plan对象
             plan = Plan(
@@ -273,9 +281,17 @@ class Planner:
             tools_list.append(f"- {schema['function']['name']}: {schema['function']['description']}")
         return "\n".join(tools_list)
 
-    def _build_planning_prompt(self, task: str, tools_info: str) -> str:
+    def _build_planning_prompt(self, task: str, tools_info: str, context: str = "") -> str:
         """构建规划提示词"""
-        return f"""请为以下任务制定详细的执行计划：
+        context_section = ""
+        if context:
+            context_section = f"""
+近期对话历史（用于理解上下文，如果用户的问题涉及之前的对话，请参考这些内容来规划）：
+{context}
+
+"""
+
+        return f"""{context_section}请为以下任务制定执行计划：
 
 任务描述：
 {task}
@@ -283,7 +299,18 @@ class Planner:
 可用工具：
 {tools_info}
 
-请按以下JSON格式输出计划（只输出JSON，不要其他内容）：
+重要：首先判断这个任务是否需要使用工具。
+- 如果任务可以直接从对话历史中回答（如用户问之前的结果、要求回忆/总结之前的内容、闲聊等），不需要使用任何工具，请返回 direct_answer：
+
+```json
+{{
+  "thinking": "判断理由",
+  "direct_answer": "直接回答内容（完整、详细，不要省略）",
+  "steps": []
+}}
+```
+
+- 如果任务确实需要使用工具（如读写文件、执行代码、列出目录等），则制定执行计划：
 
 ```json
 {{
@@ -296,24 +323,26 @@ class Planner:
       "tool_name": "需要使用的工具名称（可选）",
       "tool_args": {{"arg1": "value1"}},
       "dependencies": []
-    }},
-    {{
-      "id": 2,
-      "description": "步骤描述",
-      "goal": "该步骤要达成的目标",
-      "dependencies": [1]
     }}
   ]
 }}
 ```
 
-规划原则：
+只输出JSON，不要其他内容。
+
+规划原则（仅当需要工具时适用）：
 1. 将复杂任务分解为简单、可执行的步骤
 2. 每个步骤应该有明确的目标和预期结果
 3. 合理设置步骤之间的依赖关系
 4. 如果某个步骤需要使用特定工具，请指定tool_name
-5. 步骤数量适中（通常3-8个步骤）
-6. 步骤应该按逻辑顺序排列"""
+5. 步骤数量适中（通常1-5个步骤）
+6. 步骤应该按逻辑顺序排列
+
+严格约束（必须遵守）：
+- 每个操作只能出现一次，禁止重复步骤（例如不能有两个"执行代码"步骤）
+- 只规划用户明确要求的内容，不要添加用户未要求的额外步骤（如"优化"、"重构"、"改进"、"清理"等）
+- 不要添加"验证"或"测试"步骤，除非用户明确要求测试
+- 保持计划精简，完成用户的请求即可，不要画蛇添足"""
 
     def _parse_plan_response(self, response: str) -> Dict[str, Any]:
         """解析LLM返回的计划"""
@@ -433,26 +462,34 @@ class Planner:
 可用工具：
 {tools_info}
 
-请分析：
-1. 步骤的执行结果中是否包含需要立即处理的新信息或指令？
-2. 是否需要在当前步骤之后插入新的步骤？
-3. 新步骤是否会与现有待执行步骤冲突或重复？
+请分析执行结果是否包含阻断性问题（hard blocker），即后续步骤无法继续执行的情况。
 
-判断规则：
-- 如果执行结果中明确提到"请读取xxx文件"、"需要先处理xxx"等指令，应该插入新步骤
-- 如果执行结果揭示了新的依赖关系或前置条件，应该调整计划
-- 如果执行结果只是正常的数据或确认信息，无需调整
+严格判断规则（默认应该返回 need_adjustment: false）：
+- 只有当执行结果中出现明确的阻断性错误（如文件不存在、权限不足、依赖缺失）导致后续步骤无法执行时，才设置 need_adjustment: true
+- 如果执行结果是正常的数据、确认信息或成功信息，必须返回 need_adjustment: false
+- 绝对不要添加与现有待执行步骤重复的步骤
+- 绝对不要添加超出原始任务范围的步骤（如"优化"、"重构"、"改进"、"测试"、"清理"等）
+- 绝对不要因为"可以做得更好"而添加步骤，只在"无法继续"时才添加
 
 请按以下JSON格式输出（只输出JSON，不要其他内容）：
 
 ```json
 {{
-  "need_adjustment": true/false,
-  "reason": "需要/不需要调整的原因",
+  "need_adjustment": false,
+  "reason": "不需要调整的原因",
+  "new_steps": []
+}}
+```
+
+只有在确实存在阻断性问题时才使用以下格式：
+```json
+{{
+  "need_adjustment": true,
+  "reason": "阻断性问题描述",
   "new_steps": [
     {{
-      "description": "新步骤描述",
-      "goal": "新步骤目标",
+      "description": "解决阻断性问题的步骤描述",
+      "goal": "步骤目标",
       "tool_name": "工具名称（可选）",
       "tool_args": {{"arg": "value"}},
       "dependencies": [{executed_step.id}]

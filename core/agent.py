@@ -168,31 +168,102 @@ class SimpleAgent:
         返回:
             任务执行结果
         """
+        # 把用户原始问题记入会话，保证对话连续性
+        if self.use_persistence:
+            self.session.add_message("user", task)
+        elif self.use_memory_manager:
+            self.memory_manager.add_message("user", task, importance=0.9)
+        else:
+            self.message_history.add_message(Message.user_message(task))
+
         try:
-            # 1. 制定计划
+            # 1. 制定计划（传入近期历史，让 planner 了解对话上下文）
             self.logger.info("\n正在分析任务并制定执行计划...")
-            plan = self.planner.create_plan(task)
+            recent_history = self._get_recent_history_summary()
+            plan_or_answer = self.planner.create_plan(task, context=recent_history)
 
-            # 2. 显示计划并询问用户确认
-            print("\n" + str(plan))
-            confirm = input("\n是否执行此计划？(y/n，直接回车表示确认): ").strip().lower()
-
-            if confirm and confirm != 'y':
-                self.logger.info("用户取消执行")
-                return "任务已取消"
-
-            # 3. 执行计划
-            result = self.plan_executor.execute_plan(plan)
-
-            if result["success"]:
-                return result["final_result"]
+            # 如果 planner 返回了直接回答（不需要工具），跳过计划执行
+            if isinstance(plan_or_answer, str):
+                self.logger.info("Planner 判断无需工具，直接回答")
+                print(f"\n{plan_or_answer}")
+                final_result = plan_or_answer
             else:
-                return f"计划执行失败: {result.get('error', '未知错误')}"
+                plan = plan_or_answer
+
+                # 2. 显示计划并询问用户确认
+                print("\n" + str(plan))
+                confirm = input("\n是否执行此计划？(y/n，直接回车表示确认): ").strip().lower()
+
+                if confirm and confirm != 'y':
+                    self.logger.info("用户取消执行")
+                    final_result = "任务已取消"
+                else:
+                    # 3. 执行计划
+                    result = self.plan_executor.execute_plan(plan)
+
+                    if result["success"]:
+                        final_result = result["final_result"]
+                    else:
+                        final_result = f"计划执行失败: {result.get('error', '未知错误')}"
 
         except Exception as e:
             self.logger.error(f"规划模式执行失败: {str(e)}")
             self.logger.info("回退到普通执行模式")
             return self._run_without_planning(task)
+
+        # 把最终结果记入会话
+        if self.use_persistence:
+            self.session.add_message("assistant", final_result)
+            self._maybe_consolidate()
+            self.session_manager.save(self.session)
+        elif self.use_memory_manager:
+            self.memory_manager.add_message("assistant", final_result, importance=0.8)
+        else:
+            self.message_history.add_message(Message.assistant_message(final_result))
+
+        return final_result
+
+    def _get_recent_history_summary(self, max_pairs: int = 5) -> str:
+        """
+        获取近期对话摘要，供 planner 了解上下文
+
+        只提取最近 max_pairs 轮 user/assistant 对话，忽略 tool 消息等内部细节。
+
+        返回:
+            格式化的对话摘要字符串，无历史则返回空字符串
+        """
+        messages = []
+        if self.use_persistence:
+            messages = self.session.messages
+        elif self.use_memory_manager:
+            messages = [
+                {"role": item.role, "content": item.content}
+                for item in self.memory_manager.working_memory
+            ]
+        elif self.message_history:
+            messages = self.message_history.get_messages_as_dicts()
+
+        # 只取 user/assistant 消息，跳过最后一条（就是刚加入的当前 task）
+        pairs = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                # 截断过长内容
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                pairs.append(f"{role}: {content}")
+
+        # 去掉最后一条（当前 task，已在 planning_prompt 里了）
+        if pairs:
+            pairs = pairs[:-1]
+
+        if not pairs:
+            return ""
+
+        # 只取最近的几轮
+        recent = pairs[-(max_pairs * 2):]
+        return "\n".join(recent)
 
     def _run_without_planning(self, task: str) -> str:
         """
@@ -366,6 +437,8 @@ class SimpleAgent:
         """
         import json
 
+        self._last_tool_had_error = False  # 重置工具执行错误标记
+
         for tool_call in tool_calls:
             tool_id = tool_call.get("id", "")
             tool_name = tool_call["function"]["name"]
@@ -394,6 +467,10 @@ class SimpleAgent:
 
                 # 执行工具
                 result = tool.execute(**tool_args)
+
+                # 检查工具是否执行失败
+                if hasattr(result, 'success') and not result.success:
+                    self._last_tool_had_error = True
 
                 # 记录结果
                 if hasattr(result, 'success') and result.success:

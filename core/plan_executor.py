@@ -116,10 +116,10 @@ class PlanExecutor:
                 # 构造执行提示
                 execution_prompt = self._build_execution_prompt(step, plan)
 
-                # 使用agent执行
+                # 使用agent执行（单个步骤通常只需要1~2轮工具调用，5轮足够）
                 result = self.agent.execute_subtask(
                     task=execution_prompt,
-                    max_steps=15  # 子任务的最大步骤数（从5增加到15，避免复杂任务被过早终止）
+                    max_steps=5
                 )
 
                 # 记录结果
@@ -132,15 +132,16 @@ class PlanExecutor:
                     result_preview = result[:200] + "..." if len(result) > 200 else result
                     print(f"结果: {result_preview}")
 
-                # 反思机制：根据执行结果动态调整计划
+                # 反思机制：仅在工具执行实际报错时才触发
                 if self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
-                    new_steps = self.agent.planner.reflect_and_adjust_plan(plan, step)
-                    if new_steps:
-                        # 将新步骤插入到计划中
-                        for new_step in new_steps:
-                            plan.add_step(new_step)
-                            if self.logger:
-                                self.logger.info(f"📌 已添加新步骤: {new_step.id} - {new_step.description}")
+                    if getattr(self.agent, '_last_tool_had_error', False):
+                        new_steps = self.agent.planner.reflect_and_adjust_plan(plan, step)
+                        if new_steps:
+                            # 将新步骤插入到计划中
+                            for new_step in new_steps:
+                                plan.add_step(new_step)
+                                if self.logger:
+                                    self.logger.info(f"📌 已添加新步骤: {new_step.id} - {new_step.description}")
 
                 break  # 成功则退出重试循环
 
@@ -167,7 +168,8 @@ class PlanExecutor:
     def _build_execution_prompt(self, step: Step, plan: Plan) -> str:
         """构建步骤执行提示"""
         prompt_parts = [
-            f"执行以下步骤：",
+            f"你现在只需要执行下面这一个步骤，完成后立即汇报结果并停止。",
+            f"",
             f"步骤描述: {step.description}",
             f"目标: {step.goal}",
         ]
@@ -185,6 +187,15 @@ class PlanExecutor:
             prompt_parts.append(f"\n建议使用工具: {step.tool_name}")
             if step.tool_args:
                 prompt_parts.append(f"工具参数参考: {step.tool_args}")
+
+        # 严格边界约束
+        prompt_parts.append(
+            f"\n严格约束："
+            f"\n- 只做上述步骤描述的操作，不要超出范围"
+            f"\n- 不要提前执行后续步骤的工作（后续步骤会由系统自动调度）"
+            f"\n- 汇报结果时，必须包含工具返回的实际数据/输出内容，不要只写摘要或概述"
+            f"\n- 完成当前步骤后直接输出结果即可"
+        )
 
         return "\n".join(prompt_parts)
 

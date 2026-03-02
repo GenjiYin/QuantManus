@@ -6,7 +6,7 @@ from .agent import SimpleAgent
 from .llm_client import LLMClient
 from .message import Message, MessageHistory
 from .logger import get_logger, setup_logger
-from .memory_manager import MemoryManager, MemoryItem, CompressedMemory, TokenCounter, MemoryCompressor
+from .memory_manager import MemoryManager, MemoryItem, TokenCounter
 from .session import Session, SessionManager
 from .memory_store import MemoryStore
 from .context_builder import ContextBuilder
@@ -22,9 +22,7 @@ __all__ = [
     'setup_logger',
     'MemoryManager',
     'MemoryItem',
-    'CompressedMemory',
     'TokenCounter',
-    'MemoryCompressor',
     'Session',
     'SessionManager',
     'MemoryStore',
