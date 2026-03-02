@@ -1,6 +1,9 @@
 """
 简化的配置管理系统
 这个文件负责加载和管理应用的配置信息
+
+全局配置存放在 ~/.quantmanus/config.json
+工作空间跟随当前工作目录 (os.getcwd())
 """
 import json
 from pathlib import Path
@@ -12,24 +15,37 @@ class SimpleConfig:
     简单的配置类
 
     功能:
-    1. 从JSON文件加载配置
-    2. 提供访问配置的简单方法
-    3. 不使用复杂的单例模式或线程锁
+    1. 从 ~/.quantmanus/config.json 加载全局配置
+    2. 首次运行时自动创建默认配置文件
+    3. 工作空间 = 当前工作目录
     """
 
-    def __init__(self, config_file: str = "config.json"):
+    def __init__(self):
         """
         初始化配置
 
-        参数:
-            config_file: 配置文件路径(相对于config目录)
+        配置文件固定位于 ~/.quantmanus/config.json
         """
-        # 获取配置文件的完整路径
-        self.config_dir = Path(__file__).parent
-        self.config_path = self.config_dir / config_file
+        self.config_dir = Path.home() / ".quantmanus"
+        self.config_path = self.config_dir / "config.json"
 
-        # 加载配置
-        self.config_data = self._load_config()
+        # 加载配置（文件不存在时用默认值）
+        if self.config_path.exists():
+            self.config_data = self._load_config()
+        else:
+            self.config_data = self._get_default_config()
+
+    @property
+    def is_configured(self) -> bool:
+        """检查是否已完成配置（API Key 不是占位符）"""
+        api_key = self.get("llm.api_key", "")
+        return bool(api_key) and api_key != "your-api-key-here"
+
+    def save(self):
+        """将当前配置写入磁盘"""
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.config_path, 'w', encoding='utf-8') as f:
+            json.dump(self.config_data, f, indent=2, ensure_ascii=False)
 
     def _load_config(self) -> Dict:
         """
@@ -38,12 +54,6 @@ class SimpleConfig:
         返回:
             配置字典
         """
-        # 如果配置文件不存在,返回默认配置
-        if not self.config_path.exists():
-            print(f"警告: 配置文件 {self.config_path} 不存在,使用默认配置")
-            return self._get_default_config()
-
-        # 读取并解析JSON配置
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
@@ -65,10 +75,6 @@ class SimpleConfig:
                 "base_url": "https://api.openai.com/v1",
                 "temperature": 0.7,
                 "max_tokens": 4096
-            },
-            "workspace": {
-                "root_dir": "./workspace",
-                "max_file_size": 1048576  # 1MB
             },
             "agent": {
                 "max_steps": 20,
@@ -110,18 +116,12 @@ class SimpleConfig:
 
     def get_workspace_dir(self) -> Path:
         """
-        获取工作空间目录
+        获取工作空间目录（当前工作目录）
 
         返回:
-            工作空间目录路径
+            当前工作目录路径
         """
-        workspace_dir = self.get("workspace.root_dir", "./workspace")
-        path = Path(workspace_dir)
-
-        # 如果目录不存在,创建它
-        path.mkdir(parents=True, exist_ok=True)
-
-        return path
+        return Path.cwd()
 
     def get_max_steps(self) -> int:
         """

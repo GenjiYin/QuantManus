@@ -83,40 +83,59 @@ QuantManus 采用创新的三层记忆管理系统：
 # 克隆或下载项目
 cd quantmanus
 
-# 安装依赖
-pip install -r requirements.txt
+# 一键安装（注册为全局命令）
+pip install -e .
 ```
 
-### 配置
+安装完成后，你可以在**任意目录**下直接运行 `quantmanus` 命令。
 
-创建配置文件 `config/config.json`(以kimi大模型为例)：
+### 首次运行
 
-```json
-{
-  "llm": {
-    "model": "kimi-k2-turbo-preview",        /*必填项, 选择模型*/
-    "api_key": "模型密钥",                    /*必填项, 获取模型apikey*/
-    "base_url": "https://api.moonshot.cn/v1",  /*必填项, 获取大模型网址*/
-    "temperature": 0.7,
-    "max_tokens": 4096
-  },
-  "workspace": {
-    "root_dir": "./workspace",
-    "max_file_size": 1048576
-  },
-  "agent": {
-    "max_steps": 20,
-    "max_retry": 3
-  },
-  "logging": {
-    "level": "INFO",
-    "log_file": null,
-    "use_color": true
-  }
-}
+```bash
+quantmanus
 ```
 
-### 基础使用
+首次运行会自动进入配置引导，只需回答 3 个问题：
+
+```
+首次运行，需要配置 API 信息。
+
+请输入 API Key: sk-xxxxxxxx          ← 粘贴你的密钥，必填
+请输入 Base URL (回车使用默认):        ← 不确定就直接回车
+请输入模型名称 (回车使用默认):          ← 不确定就直接回车
+
+配置已保存！
+```
+
+配置会自动保存到 `~/.quantmanus/config.json`，之后再运行就不会再询问了。
+
+> **提示**：如果需要修改配置，直接编辑 `~/.quantmanus/config.json` 即可。
+
+### 工作空间
+
+QuantManus 以**当前目录**作为工作空间。在不同目录下运行，会话数据和记忆互相独立：
+
+```bash
+cd D:\my-project
+quantmanus              # 工作空间 = D:\my-project
+
+cd D:\another-project
+quantmanus              # 工作空间 = D:\another-project，独立的会话
+```
+
+### 使用方式
+
+```bash
+# 交互式对话模式
+quantmanus
+
+# 单次任务模式
+quantmanus "创建一个hello.txt文件"
+```
+
+### 开发者用法
+
+如果你想在代码中使用 QuantManus：
 
 ```python
 from core import SimpleAgent, LLMClient
@@ -136,79 +155,25 @@ tools = [
     PythonExecuteTool()   # Python代码执行
 ]
 
-# 3. 创建 Agent (启用智能记忆管理)
+# 3. 创建 Agent
 agent = SimpleAgent(
     name="QuantManus",
     llm_client=llm_client,
     tools=tools,
     system_prompt="你是一个智能助手",
-    use_memory_manager=True,      # 启用记忆管理
-    max_context_tokens=6000,       # 最大上下文tokens
-    enable_planning=False          # 是否启用任务规划（可选）
+    enable_planning=True   # 启用任务规划（可选）
 )
 
 # 4. 运行任务
 result = agent.run("帮我分析一下数据文件")
 print(result)
-
-# 5. 查看记忆统计
-agent.print_memory_stats()
 ```
 
-### 使用任务规划模式（可选）
+### 任务规划模式
 
-对于复杂任务，可以启用任务规划功能，让 AI 先制定计划再执行：
-
-```python
-# 创建启用规划模式的 Agent
-agent = SimpleAgent(
-    name="PlanningAgent",
-    llm_client=llm_client,
-    tools=tools,
-    system_prompt="你是一个智能助手",
-    enable_planning=True  # 🔥 启用任务规划
-)
-
-# 执行复杂任务
-task = """分析销售数据:
-1. 生成100条模拟销售记录
-2. 保存到CSV文件
-3. 进行统计分析
-4. 生成分析报告"""
-
-result = agent.run(task)
-
-# Agent 会：
-# 1️⃣ 分析任务并生成执行计划
-# 2️⃣ 展示计划给用户确认
-# 3️⃣ 按步骤有序执行
-# 4️⃣ 跟踪每个步骤的进度和状态
-```
-
-**规划模式的优势**：
-- ✅ 将复杂任务分解为清晰的步骤
-- ✅ 用户可以查看和确认执行计划
-- ✅ 实时跟踪执行进度
-- ✅ 步骤失败时自动重试
-- ✅ 更好的错误处理和恢复能力
+对于复杂任务，QuantManus 会自动将任务分解为可执行的步骤，展示计划给用户确认后按步执行。
 
 详细文档：[任务规划系统使用指南](docs/PLANNING_GUIDE.md)
-
-### 运行示例
-
-```bash
-# 交互式对话模式
-python main.py
-
-# 单次任务模式
-python main.py "创建一个hello.txt文件"
-
-# 记忆管理完整演示
-python examples/example_memory_management.py
-
-# 任务规划模式演示 🆕
-python examples/example_planning.py
-```
 
 ---
 
@@ -392,6 +357,9 @@ quantmanus/
 │   ├── agent.py            # Agent核心类
 │   ├── llm_client.py       # LLM客户端
 │   ├── memory_manager.py   # 记忆管理器 ⭐
+│   ├── session.py          # 会话管理
+│   ├── memory_store.py     # 持久化记忆存储
+│   ├── context_builder.py  # 上下文构建
 │   ├── message.py          # 消息类
 │   └── logger.py           # 日志工具
 ├── tools/                   # 工具模块
@@ -399,17 +367,22 @@ quantmanus/
 │   ├── file_tool.py        # 文件操作工具
 │   └── python_tool.py      # Python执行工具
 ├── config/                  # 配置模块
-│   └── config.py           # 配置管理
+│   └── config.py           # 配置管理（全局配置 ~/.quantmanus/）
 ├── examples/                # 示例代码
-│   ├── example_basic.py    # 基础示例
-│   └── example_memory_management.py  # 记忆管理示例
 ├── docs/                    # 文档
-│   ├── MEMORY_MANAGEMENT.md  # 记忆管理详解
-│   └── ARCHITECTURE.md       # 架构说明
-├── main.py                  # 主入口
+├── main.py                  # 主入口 & CLI 命令入口
+├── pyproject.toml           # 打包配置（pip install -e .）
 ├── requirements.txt         # 依赖列表
 └── README.md               # 本文件
 ```
+
+**运行时目录说明**：
+
+| 位置 | 内容 |
+|------|------|
+| `~/.quantmanus/config.json` | 全局配置（API Key、模型等） |
+| `当前目录/sessions/` | 当前工作空间的会话数据 |
+| `当前目录/memory/` | 当前工作空间的长期记忆 |
 
 ---
 

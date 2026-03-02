@@ -1,7 +1,7 @@
 {
   "llm": {
     "model": "kimi-k2-turbo-preview",
-    "api_key": "sk-xxxxxxxxxxxxxxxxxxxx",
+    "api_key": "sk-cAfMEDf3dDA8qCwvs7PS9rx4947IBp13mTjb3bIsUbtumVsC",
     "base_url": "https://api.moonshot.cn/v1",
     "temperature": 0.7,
     "max_tokens": 4096
@@ -13,6 +13,11 @@
   "agent": {
     "max_steps": 20,
     "max_retry": 3
+  },
+  "persistence": {
+    "session_key": "cli:direct",
+    "consolidation_threshold": 50,
+    "max_history_messages": 500
   },
   "logging": {
     "level": "INFO",

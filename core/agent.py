@@ -1,8 +1,14 @@
 """
 AI Agent核心类
 这是整个系统的核心,负责协调LLM、工具和任务执行
+
+支持三种记忆模式:
+1. use_persistence=True (推荐) - 持久化模式，会话保存到磁盘，支持长期记忆
+2. use_memory_manager=True - 内存记忆管理模式（旧版，不持久化）
+3. 两者都为 False - 简单消息历史模式
 """
 from typing import List, Dict, Any, Optional
+from pathlib import Path
 from .message import Message, MessageHistory
 from .llm_client import LLMClient
 from .logger import get_logger
@@ -25,7 +31,6 @@ class SimpleAgent:
         name: Agent名称
         llm_client: LLM客户端
         tools: 可用工具列表
-        message_history: 消息历史
         max_steps: 最大执行步数
     """
 
@@ -36,9 +41,14 @@ class SimpleAgent:
         tools: List[Any],
         system_prompt: Optional[str] = None,
         max_steps: int = 20,
-        use_memory_manager: bool = True,
+        use_memory_manager: bool = False,
         max_context_tokens: int = 6000,
-        enable_planning: bool = False
+        enable_planning: bool = False,
+        # 持久化模式参数
+        use_persistence: bool = True,
+        workspace: Optional[Path] = None,
+        session_key: str = "cli:direct",
+        consolidation_threshold: int = 50,
     ):
         """
         初始化Agent
@@ -49,16 +59,22 @@ class SimpleAgent:
             tools: 工具列表
             system_prompt: 系统提示词
             max_steps: 最大执行步数
-            use_memory_manager: 是否使用智能记忆管理(推荐开启)
+            use_memory_manager: 是否使用内存记忆管理(旧版)
             max_context_tokens: 最大上下文token数
             enable_planning: 是否启用任务规划模式
+            use_persistence: 是否启用持久化模式(推荐)
+            workspace: 工作空间目录路径
+            session_key: 会话标识
+            consolidation_threshold: 触发记忆整合的消息数阈值
         """
         self.name = name
         self.llm_client = llm_client
         self.tools = tools
         self.max_steps = max_steps
-        self.use_memory_manager = use_memory_manager
         self.enable_planning = enable_planning
+        self.use_persistence = use_persistence
+        self.use_memory_manager = use_memory_manager if not use_persistence else False
+        self.base_system_prompt = system_prompt or ""
 
         # 创建日志记录器
         self.logger = get_logger(f"Agent.{name}")
@@ -72,8 +88,29 @@ class SimpleAgent:
             self.plan_executor = None
 
         # 根据配置选择记忆管理方式
-        if use_memory_manager:
-            # 使用智能记忆管理器
+        if use_persistence:
+            # 持久化模式: 使用 SessionManager + MemoryStore + ContextBuilder
+            from .session import SessionManager
+            from .memory_store import MemoryStore
+            from .context_builder import ContextBuilder
+
+            if workspace is None:
+                from config.config import global_config
+                workspace = global_config.get_workspace_dir()
+
+            self.workspace = Path(workspace)
+            self.session_manager = SessionManager(self.workspace)
+            self.memory_store = MemoryStore(self.workspace)
+            self.context_builder = ContextBuilder(self.workspace, self.memory_store)
+            self.session = self.session_manager.get_or_create(session_key)
+            self.consolidation_threshold = consolidation_threshold
+
+            # 持久化模式下不使用旧的记忆管理
+            self.memory_manager = None
+            self.message_history = None
+
+        elif self.use_memory_manager:
+            # 内存记忆管理模式（旧版）
             self.memory_manager = MemoryManager(
                 max_working_memory_tokens=max_context_tokens // 3,
                 max_total_tokens=max_context_tokens,
@@ -81,15 +118,16 @@ class SimpleAgent:
                 llm_client=llm_client,
                 model=llm_client.model
             )
-            self.message_history = None  # 不使用旧的历史管理
+            self.message_history = None
+            self.session = None
 
-            # 添加系统提示词到记忆管理器
             if system_prompt:
                 self.memory_manager.add_system_message(system_prompt)
         else:
-            # 使用传统的消息历史
+            # 简单消息历史模式
             self.message_history = MessageHistory()
             self.memory_manager = None
+            self.session = None
 
             if system_prompt:
                 self.message_history.add_message(
@@ -132,7 +170,7 @@ class SimpleAgent:
         """
         try:
             # 1. 制定计划
-            self.logger.info("\n🤔 正在分析任务并制定执行计划...")
+            self.logger.info("\n正在分析任务并制定执行计划...")
             plan = self.planner.create_plan(task)
 
             # 2. 显示计划并询问用户确认
@@ -158,7 +196,7 @@ class SimpleAgent:
 
     def _run_without_planning(self, task: str) -> str:
         """
-        不使用规划模式执行任务（原始执行逻辑）
+        不使用规划模式执行任务
 
         参数:
             task: 用户任务描述
@@ -167,7 +205,9 @@ class SimpleAgent:
             任务执行结果
         """
         # 添加用户消息
-        if self.use_memory_manager:
+        if self.use_persistence:
+            self.session.add_message("user", task)
+        elif self.use_memory_manager:
             self.memory_manager.add_message("user", task, importance=0.9)
         else:
             self.message_history.add_message(Message.user_message(task))
@@ -190,6 +230,11 @@ class SimpleAgent:
 
         # 获取最终结果
         final_result = self._get_final_result()
+
+        # 持久化模式: 检查是否需要整合记忆，然后保存会话
+        if self.use_persistence:
+            self._maybe_consolidate()
+            self.session_manager.save(self.session)
 
         self.logger.info(f"\n{'='*50}")
         self.logger.info("任务执行完成")
@@ -225,8 +270,17 @@ class SimpleAgent:
             是否继续执行(True表示继续,False表示结束)
         """
         try:
-            # 获取消息历史
-            if self.use_memory_manager:
+            # 获取消息列表
+            if self.use_persistence:
+                # 从 session key 解析渠道信息，如 "cli:direct" → channel="cli", chat_id="direct"
+                channel, _, chat_id = self.session.key.partition(":")
+                messages = self.context_builder.build_messages(
+                    session=self.session,
+                    base_system_prompt=self.base_system_prompt,
+                    channel=channel or None,
+                    chat_id=chat_id or None,
+                )
+            elif self.use_memory_manager:
                 messages = self.memory_manager.get_context_messages()
             else:
                 messages = self.message_history.get_messages_as_dicts()
@@ -248,8 +302,14 @@ class SimpleAgent:
                 if response.get("content"):
                     self.logger.info(f"LLM回复: {response['content']}")
 
-                # 添加包含工具调用的助手消息(可能包含content)
-                if self.use_memory_manager:
+                # 添加包含工具调用的助手消息
+                if self.use_persistence:
+                    self.session.add_message(
+                        "assistant",
+                        response.get("content"),
+                        tool_calls=response["tool_calls"]
+                    )
+                elif self.use_memory_manager:
                     self.memory_manager.add_message(
                         "assistant",
                         response.get("content"),
@@ -274,12 +334,14 @@ class SimpleAgent:
             if response.get("content"):
                 self.logger.info(f"LLM回复: {response['content']}")
 
-                # 添加助手消息到历史
-                if self.use_memory_manager:
+                # 添加助手消息
+                if self.use_persistence:
+                    self.session.add_message("assistant", response["content"])
+                elif self.use_memory_manager:
                     self.memory_manager.add_message(
                         "assistant",
                         response["content"],
-                        importance=0.8  # 最终回复通常很重要
+                        importance=0.8
                     )
                 else:
                     self.message_history.add_message(
@@ -325,9 +387,7 @@ class SimpleAgent:
                 if tool_name not in self.tool_map:
                     error_msg = f"工具 '{tool_name}' 不存在"
                     self.logger.error(f"错误: {error_msg}")
-                    self.message_history.add_message(
-                        Message.tool_message(tool_id, tool_name, error_msg)
-                    )
+                    self._add_tool_message(tool_id, tool_name, error_msg)
                     continue
 
                 tool = self.tool_map[tool_name]
@@ -342,48 +402,45 @@ class SimpleAgent:
                     self.logger.warning(f"工具执行结果: {result}")
 
                 result_str = str(result)
-
-                # 评估工具结果的重要性
-                tool_importance = 0.6
-                if "error" in result_str.lower() or "错误" in result_str.lower():
-                    tool_importance = 0.8
-                elif len(result_str) > 1000:  # 大量数据
-                    tool_importance = 0.7
-
-                # 添加工具返回消息
-                if self.use_memory_manager:
-                    self.memory_manager.add_message(
-                        "tool",
-                        result_str,
-                        importance=tool_importance,
-                        tool_call_id=tool_id,
-                        name=tool_name
-                    )
-                else:
-                    self.message_history.add_message(
-                        Message.tool_message(
-                            tool_id,
-                            tool_name,
-                            result_str
-                        )
-                    )
+                self._add_tool_message(tool_id, tool_name, result_str)
 
             except Exception as e:
                 error_msg = f"工具执行失败: {str(e)}"
                 self.logger.error(f"错误: {error_msg}")
+                self._add_tool_message(tool_id, tool_name, error_msg)
 
-                if self.use_memory_manager:
-                    self.memory_manager.add_message(
-                        "tool",
-                        error_msg,
-                        importance=0.9,  # 错误信息很重要
-                        tool_call_id=tool_id,
-                        name=tool_name
-                    )
-                else:
-                    self.message_history.add_message(
-                        Message.tool_message(tool_id, tool_name, error_msg)
-                    )
+    def _add_tool_message(self, tool_id: str, tool_name: str, content: str):
+        """
+        添加工具返回消息到当前活跃的记忆系统
+
+        参数:
+            tool_id: 工具调用ID
+            tool_name: 工具名称
+            content: 工具返回内容
+        """
+        if self.use_persistence:
+            self.session.add_message(
+                "tool", content,
+                tool_call_id=tool_id,
+                name=tool_name
+            )
+        elif self.use_memory_manager:
+            # 评估工具结果的重要性
+            tool_importance = 0.6
+            if "error" in content.lower() or "错误" in content.lower():
+                tool_importance = 0.8
+            elif len(content) > 1000:
+                tool_importance = 0.7
+            self.memory_manager.add_message(
+                "tool", content,
+                importance=tool_importance,
+                tool_call_id=tool_id,
+                name=tool_name
+            )
+        else:
+            self.message_history.add_message(
+                Message.tool_message(tool_id, tool_name, content)
+            )
 
     def _get_final_result(self) -> str:
         """
@@ -392,30 +449,100 @@ class SimpleAgent:
         返回:
             任务执行结果摘要
         """
-        if self.use_memory_manager:
-            # 从记忆管理器获取最近消息
-            recent_messages = list(self.memory_manager.working_memory)[-5:]
+        if self.use_persistence:
+            # 从 session 中找最后一条 assistant 消息
+            for msg in reversed(self.session.messages[-10:]):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    return msg["content"]
+            return "任务已完成"
 
-            # 找到最后一条助手消息
+        elif self.use_memory_manager:
+            recent_messages = list(self.memory_manager.working_memory)[-5:]
             for item in reversed(recent_messages):
                 if item.role == "assistant" and item.content:
                     return item.content
-
             return "任务已完成"
-        else:
-            # 获取最后几条消息
-            recent_messages = self.message_history.get_last_n_messages(5)
 
-            # 找到最后一条助手消息
+        else:
+            recent_messages = self.message_history.get_last_n_messages(5)
             for msg in reversed(recent_messages):
                 if msg.role == "assistant" and msg.content:
                     return msg.content
-
             return "任务已完成"
+
+    def _maybe_consolidate(self):
+        """
+        检查是否需要整合记忆
+
+        当未整合的消息数超过阈值时，触发 LLM 驱动的记忆整合
+        """
+        if not self.use_persistence:
+            return
+
+        unconsolidated = self.session.get_unconsolidated_count()
+        if unconsolidated >= self.consolidation_threshold:
+            self.logger.info(
+                f"未整合消息数 ({unconsolidated}) >= 阈值 ({self.consolidation_threshold})，"
+                "触发记忆整合..."
+            )
+            success = self.memory_store.consolidate(
+                session=self.session,
+                llm_client=self.llm_client,
+                memory_window=self.consolidation_threshold,
+            )
+            if success:
+                self.session_manager.save(self.session)
+                self.logger.info("记忆整合完成")
+            else:
+                self.logger.warning("记忆整合失败")
+
+    def clear_session(self, archive: bool = True):
+        """
+        清空当前会话
+
+        参数:
+            archive: 是否在清空前归档会话内容到长期记忆
+        """
+        if not self.use_persistence:
+            if self.use_memory_manager:
+                self.memory_manager.clear()
+            elif self.message_history:
+                self.message_history.clear()
+            return
+
+        # 持久化模式: 先归档再清空
+        if archive and self.session.messages:
+            self.logger.info("正在归档当前会话到长期记忆...")
+            self.memory_store.consolidate(
+                self.session, self.llm_client, archive_all=True
+            )
+
+        self.session.clear()
+        self.session_manager.save(self.session)
+        self.logger.info("会话已清空")
+
+    def save_session(self):
+        """手动保存当前会话到磁盘"""
+        if self.use_persistence:
+            self.session_manager.save(self.session)
 
     def print_memory_stats(self):
         """打印记忆管理统计信息"""
-        if self.use_memory_manager:
+        if self.use_persistence:
+            memory_content = self.memory_store.read_long_term()
+            msg_count = len(self.session.messages)
+            unconsolidated = self.session.get_unconsolidated_count()
+            print("\n" + "=" * 50)
+            print("记忆系统统计")
+            print("=" * 50)
+            print(f"会话消息总数: {msg_count}")
+            print(f"未整合消息数: {unconsolidated}")
+            print(f"整合阈值: {self.consolidation_threshold}")
+            print(f"长期记忆: {'有内容' if memory_content else '空'}")
+            if memory_content:
+                print(f"长期记忆大小: {len(memory_content)} 字符")
+            print("=" * 50 + "\n")
+        elif self.use_memory_manager:
             self.memory_manager.print_stats()
         else:
             self.logger.info("未启用智能记忆管理")

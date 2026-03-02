@@ -3,16 +3,12 @@
 展示如何使用重构后的QuantManus系统
 """
 import sys
+import logging
 from pathlib import Path
-
-# 添加项目根目录到Python路径
-project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
 
 from core import SimpleAgent, LLMClient, Message, setup_logger
 from tools import ReadFileTool, WriteFileTool, ListDirectoryTool, PythonExecuteTool
 from config.config import global_config
-import logging
 
 
 def create_agent() -> SimpleAgent:
@@ -64,29 +60,63 @@ def create_agent() -> SimpleAgent:
 - 给出的回复要清晰、专业、有条理
 """
 
-    # 创建Agent
+    # 获取持久化配置
+    persistence_config = global_config.get("persistence", {})
+    workspace = global_config.get_workspace_dir()
+
+    # 创建Agent（使用持久化模式）
     agent = SimpleAgent(
         name="QuantManus",
         llm_client=llm_client,
         tools=tools,
         system_prompt=system_prompt,
         max_steps=global_config.get_max_steps(),
-        use_memory_manager=True,      # ← 启用记忆管理
-        enable_planning=True          # ← 启用规划模式
+        use_persistence=True,
+        workspace=workspace,
+        session_key=persistence_config.get("session_key", "cli:direct"),
+        consolidation_threshold=persistence_config.get("consolidation_threshold", 50),
+        enable_planning=True
     )
 
     return agent
+
+
+def first_run_setup():
+    """首次运行交互式引导，让用户输入 API 配置"""
+    print("首次运行，需要配置 API 信息。\n")
+
+    api_key = input("请输入 API Key: ").strip()
+    if not api_key:
+        print("API Key 不能为空，退出。")
+        sys.exit(1)
+
+    base_url = input("请输入 Base URL (回车使用默认 https://api.openai.com/v1): ").strip()
+    model = input("请输入模型名称 (回车使用默认 gpt-4o): ").strip()
+
+    global_config.config_data["llm"]["api_key"] = api_key
+    if base_url:
+        global_config.config_data["llm"]["base_url"] = base_url
+    if model:
+        global_config.config_data["llm"]["model"] = model
+
+    global_config.save()
+    print(f"\n配置已保存到 {global_config.config_path}\n")
+
 
 def main():
     """
     主函数
     """
+    # 首次运行或未配置时，交互式引导
+    if not global_config.is_configured:
+        first_run_setup()
+
     # 设置日志
     logger = setup_logger("QuantManus", level="INFO")
 
-    logger.info("="*60)
-    logger.info("欢迎使用 quantmanus ")
-    logger.info("="*60)
+    logger.info("=" * 60)
+    logger.info("欢迎使用 quantmanus")
+    logger.info("=" * 60)
 
     try:
         # 创建Agent
@@ -103,19 +133,28 @@ def main():
             result = agent.run(task)
 
             # 打印结果
-            logger.info("\n" + "="*60)
+            logger.info("\n" + "=" * 60)
             logger.info("最终结果:")
-            logger.info("="*60)
-            print(result)  # 最终结果用print输出,更清晰
+            logger.info("=" * 60)
+            print(result)
 
         else:
             # 交互式多轮对话模式
             print("\n交互式对话模式")
             print("输入你的任务,Agent会帮你完成")
             print("输入 'exit' 或 'quit' 退出程序")
-            print("输入 'clear' 清空对话历史")
+            print("输入 'clear' 清空对话历史（归档到长期记忆）")
+            print("输入 'new' 开始新会话")
+            print("输入 'sessions' 查看所有保存的会话")
+            print("输入 'memory' 查看长期记忆内容")
+            print("输入 'stats' 查看记忆统计")
             print("输入 'debug' 切换调试模式")
-            print("="*60 + "\n")
+            print("=" * 60 + "\n")
+
+            # 显示已恢复的会话信息
+            if agent.use_persistence and agent.session.messages:
+                msg_count = len(agent.session.messages)
+                print(f"[已恢复上次会话，包含 {msg_count} 条消息]\n")
 
             while True:
                 # 获取用户输入
@@ -127,6 +166,10 @@ def main():
 
                 # 检查退出命令
                 if task.lower() in ['exit', 'quit', '退出']:
+                    # 退出前保存会话
+                    if agent.use_persistence:
+                        agent.save_session()
+                        print("[会话已保存]")
                     print("再见!")
                     break
 
@@ -135,40 +178,61 @@ def main():
                     current_level = logger.level
                     if current_level == logging.DEBUG:
                         logger.setLevel(logging.INFO)
-                        print("✓ 已切换到INFO模式\n")
+                        print("已切换到INFO模式\n")
                     else:
                         logger.setLevel(logging.DEBUG)
-                        print("✓ 已切换到DEBUG模式(显示详细信息)\n")
+                        print("已切换到DEBUG模式(显示详细信息)\n")
                     continue
 
-                # 检查清空历史命令
+                # 清空历史命令（归档到长期记忆）
                 if task.lower() in ['clear', '清空']:
-                    agent.message_history.clear()
-                    # 重新添加系统提示词
-                    system_prompt = """你是一个智能助手,能够帮助用户完成各种任务。
+                    agent.clear_session(archive=True)
+                    print("对话历史已清空（已归档到长期记忆）\n")
+                    continue
 
-你可以使用以下工具:
-1. read_file - 读取文件内容
-2. write_file - 写入文件
-3. list_directory - 列出目录内容
-4. execute_python - 执行Python代码
+                # 开始新会话
+                if task.lower() in ['new', '新建']:
+                    agent.clear_session(archive=True)
+                    print("已开始新会话（上次会话已归档到长期记忆）\n")
+                    continue
 
-工作流程:
-1. 理解用户的任务需求
-2. 制定解决方案
-3. 使用合适的工具执行操作
-4. 根据结果调整策略
-5. 完成任务后给出清晰的总结
+                # 列出所有会话
+                if task.lower() in ['sessions', '会话']:
+                    if agent.use_persistence:
+                        sessions = agent.session_manager.list_sessions()
+                        if sessions:
+                            print("\n保存的会话:")
+                            print("-" * 50)
+                            for s in sessions:
+                                print(f"  Key: {s['key']}")
+                                print(f"  更新: {s['updated_at']}")
+                                print(f"  路径: {s['path']}")
+                                print("-" * 50)
+                        else:
+                            print("暂无保存的会话")
+                        print()
+                    else:
+                        print("未启用持久化模式\n")
+                    continue
 
-注意事项:
-- 在执行操作前,先思考是否需要检查文件或目录是否存在
-- 执行Python代码时要注意安全性
-- 给出的回复要清晰、专业、有条理
-"""
-                    agent.message_history.add_message(
-                        Message.system_message(system_prompt)
-                    )
-                    print("✓ 对话历史已清空\n")
+                # 查看长期记忆
+                if task.lower() in ['memory', '记忆']:
+                    if agent.use_persistence:
+                        content = agent.memory_store.read_long_term()
+                        if content:
+                            print("\n长期记忆 (MEMORY.md):")
+                            print("-" * 50)
+                            print(content)
+                            print("-" * 50 + "\n")
+                        else:
+                            print("长期记忆为空（对话足够多后会自动生成）\n")
+                    else:
+                        print("未启用持久化模式\n")
+                    continue
+
+                # 查看统计信息
+                if task.lower() in ['stats', '统计']:
+                    agent.print_memory_stats()
                     continue
 
                 # 跳过空输入
@@ -179,12 +243,16 @@ def main():
                 result = agent.run(task)
 
                 # 打印结果
-                print("\n" + "-"*60)
+                print("\n" + "-" * 60)
                 print(f"最终结果: {result}")
-                print("-"*60 + "\n")
+                print("-" * 60 + "\n")
 
     except KeyboardInterrupt:
         print("\n\n用户中断,程序退出")
+        # 退出前保存会话
+        if agent.use_persistence:
+            agent.save_session()
+            print("[会话已保存]")
     except Exception as e:
         logger.error(f"\n错误: {str(e)}")
         import traceback
