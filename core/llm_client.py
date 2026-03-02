@@ -30,7 +30,7 @@ class LLMClient:
         api_key: str,
         base_url: str,
         temperature: float = 0.7,
-        max_tokens: int = 4096
+        max_tokens: Optional[int] = None
     ):
         """
         初始化LLM客户端
@@ -40,7 +40,7 @@ class LLMClient:
             api_key: API密钥
             base_url: API基础URL
             temperature: 温度参数(0-2)
-            max_tokens: 最大token数
+            max_tokens: 最大token数（None 表示不限制，使用模型默认值）
         """
         self.model = model
         self.temperature = temperature
@@ -78,8 +78,10 @@ class LLMClient:
                 "model": self.model,
                 "messages": messages,
                 "temperature": self.temperature,
-                "max_tokens": self.max_tokens
             }
+
+            if self.max_tokens is not None:
+                request_params["max_tokens"] = self.max_tokens
 
             # 如果提供了工具,添加工具参数
             if tools:
