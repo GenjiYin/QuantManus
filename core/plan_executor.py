@@ -116,10 +116,12 @@ class PlanExecutor:
                 # 构造执行提示
                 execution_prompt = self._build_execution_prompt(step, plan)
 
-                # 使用agent执行（单个步骤通常只需要1~2轮工具调用，5轮足够）
+                # 使用agent执行（如果步骤指定了工具，只允许使用该工具）
+                allowed_tools = [step.tool_name] if step.tool_name else None
                 result = self.agent.execute_subtask(
                     task=execution_prompt,
-                    max_steps=5
+                    max_steps=5,
+                    allowed_tools=allowed_tools
                 )
 
                 # 记录结果

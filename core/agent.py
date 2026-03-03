@@ -162,6 +162,9 @@ class SimpleAgent:
         """
         使用规划模式执行任务
 
+        先尝试直接响应（闲聊、回忆等不需要工具的场景），
+        只有当 LLM 判断需要工具时才进入规划流程。
+
         参数:
             task: 用户任务描述
 
@@ -177,34 +180,37 @@ class SimpleAgent:
             self.message_history.add_message(Message.user_message(task))
 
         try:
-            # 1. 制定计划（传入近期历史，让 planner 了解对话上下文）
-            self.logger.info("\n正在分析任务并制定执行计划...")
-            recent_history = self._get_recent_history_summary()
-            plan_or_answer = self.planner.create_plan(task, context=recent_history)
-
-            # 如果 planner 返回了直接回答（不需要工具），跳过计划执行
-            if isinstance(plan_or_answer, str):
-                self.logger.info("Planner 判断无需工具，直接回答")
-                print(f"\n{plan_or_answer}")
-                final_result = plan_or_answer
+            # Phase 1: 尝试直接响应（不经过 Planner）
+            direct = self._try_direct_response()
+            if direct is not None:
+                final_result = direct
             else:
-                plan = plan_or_answer
+                # Phase 2: LLM 需要工具 → 进入规划流程
+                self.logger.info("\n正在制定执行计划...")
+                recent_history = self._get_recent_history_summary()
+                plan_or_answer = self.planner.create_plan(task, context=recent_history)
 
-                # 2. 显示计划并询问用户确认
-                print("\n" + str(plan))
-                confirm = input("\n是否执行此计划？(y/n，直接回车表示确认): ").strip().lower()
-
-                if confirm and confirm != 'y':
-                    self.logger.info("用户取消执行")
-                    final_result = "任务已取消"
+                # Planner 也可能判断可以直接回答（二次兜底）
+                if isinstance(plan_or_answer, str):
+                    final_result = plan_or_answer
                 else:
-                    # 3. 执行计划
-                    result = self.plan_executor.execute_plan(plan)
+                    plan = plan_or_answer
 
-                    if result["success"]:
-                        final_result = result["final_result"]
+                    # 显示计划并询问用户确认
+                    print("\n" + str(plan))
+                    confirm = input("\n是否执行此计划？(y/n，直接回车表示确认): ").strip().lower()
+
+                    if confirm and confirm != 'y':
+                        self.logger.info("用户取消执行")
+                        final_result = "任务已取消"
                     else:
-                        final_result = f"计划执行失败: {result.get('error', '未知错误')}"
+                        # 执行计划
+                        result = self.plan_executor.execute_plan(plan)
+
+                        if result["success"]:
+                            final_result = result["final_result"]
+                        else:
+                            final_result = f"计划执行失败: {result.get('error', '未知错误')}"
 
         except Exception as e:
             self.logger.error(f"规划模式执行失败: {str(e)}")
@@ -222,6 +228,53 @@ class SimpleAgent:
             self.message_history.add_message(Message.assistant_message(final_result))
 
         return final_result
+
+    def _try_direct_response(self) -> str | None:
+        """
+        尝试让 LLM 直接响应（不经过 Planner）
+
+        用 Agent 自身的人格和完整会话上下文调用 LLM。
+        如果 LLM 不需要调用工具就能回答（闲聊、问候、回忆等），返回回复文本。
+        如果 LLM 请求工具调用，说明任务需要工具，返回 None 交给 Planner。
+
+        返回:
+            str: 直接回复内容（不需要工具时）
+            None: 需要工具，应进入规划流程
+        """
+        try:
+            # 构建消息（与 _think_and_act 相同的上下文）
+            if self.use_persistence:
+                channel, _, chat_id = self.session.key.partition(":")
+                messages = self.context_builder.build_messages(
+                    session=self.session,
+                    base_system_prompt=self.base_system_prompt,
+                    channel=channel or None,
+                    chat_id=chat_id or None,
+                )
+            elif self.use_memory_manager:
+                messages = self.memory_manager.get_context_messages()
+            else:
+                messages = self.message_history.get_messages_as_dicts()
+
+            # 提供工具定义，让 LLM 自行判断是否需要工具
+            tools = [tool.get_schema() for tool in self.tools]
+
+            response = self.llm_client.chat(
+                messages=messages,
+                tools=tools,
+                tool_choice="auto"
+            )
+
+            # LLM 没有请求工具 → 可以直接回答
+            if "tool_calls" not in response and response.get("content"):
+                return response["content"]
+
+            # LLM 请求了工具 → 需要规划
+            return None
+
+        except Exception as e:
+            self.logger.warning(f"直接响应尝试失败: {e}")
+            return None
 
     def _get_recent_history_summary(self, max_pairs: int = 5) -> str:
         """
@@ -313,25 +366,28 @@ class SimpleAgent:
 
         return final_result
 
-    def execute_subtask(self, task: str, max_steps: int = 5) -> str:
+    def execute_subtask(self, task: str, max_steps: int = 5, allowed_tools: list[str] | None = None) -> str:
         """
         执行子任务（用于计划执行器调用）
 
         参数:
             task: 子任务描述
             max_steps: 最大执行步数
+            allowed_tools: 允许使用的工具名称列表，None 表示不限制
 
         返回:
             子任务执行结果
         """
         original_max_steps = self.max_steps
         self.max_steps = max_steps
+        self._allowed_tools = allowed_tools
 
         try:
             result = self._run_without_planning(task)
             return result
         finally:
             self.max_steps = original_max_steps
+            self._allowed_tools = None
 
     def _think_and_act(self) -> bool:
         """
@@ -356,8 +412,12 @@ class SimpleAgent:
             else:
                 messages = self.message_history.get_messages_as_dicts()
 
-            # 获取工具定义
-            tools = [tool.get_schema() for tool in self.tools]
+            # 获取工具定义（子任务执行时可能被限制为特定工具）
+            allowed = getattr(self, '_allowed_tools', None)
+            if allowed:
+                tools = [tool.get_schema() for tool in self.tools if tool.name in allowed]
+            else:
+                tools = [tool.get_schema() for tool in self.tools]
 
             # 调用LLM
             self.logger.debug("正在调用LLM思考...")
