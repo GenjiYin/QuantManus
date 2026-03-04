@@ -79,13 +79,7 @@ class SimpleAgent:
         # 创建日志记录器
         self.logger = get_logger(f"Agent.{name}")
 
-        # 初始化规划器和执行器
-        if enable_planning:
-            self.planner = Planner(llm_client, tools, self.logger)
-            self.plan_executor = PlanExecutor(self, self.logger)
-        else:
-            self.planner = None
-            self.plan_executor = None
+        # 规划器在 __init__ 末尾初始化（需要等 skills_loader 就绪）
 
         # 根据配置选择记忆管理方式
         if use_persistence:
@@ -94,14 +88,19 @@ class SimpleAgent:
             from .memory_store import MemoryStore
             from .context_builder import ContextBuilder
 
+            from config.config import global_config
+
             if workspace is None:
-                from config.config import global_config
                 workspace = global_config.get_workspace_dir()
 
             self.workspace = Path(workspace)
             self.session_manager = SessionManager(self.workspace)
             self.memory_store = MemoryStore(self.workspace)
-            self.context_builder = ContextBuilder(self.workspace, self.memory_store)
+
+            from .skills_loader import SkillsLoader
+            self.skills_loader = SkillsLoader(global_config.get_skills_dir())
+
+            self.context_builder = ContextBuilder(self.workspace, self.memory_store, skills_loader=self.skills_loader)
             self.session = self.session_manager.get_or_create(session_key)
             self.consolidation_threshold = consolidation_threshold
 
@@ -136,6 +135,15 @@ class SimpleAgent:
 
         # 创建工具名称到工具对象的映射
         self.tool_map = {tool.name: tool for tool in tools}
+
+        # 初始化规划器和执行器（放在最后，确保 skills_loader 已就绪）
+        if self.enable_planning:
+            skills = getattr(self, 'skills_loader', None)
+            self.planner = Planner(llm_client, tools, self.logger, skills_loader=skills)
+            self.plan_executor = PlanExecutor(self, self.logger)
+        else:
+            self.planner = None
+            self.plan_executor = None
 
     def run(self, task: str) -> str:
         """
@@ -180,37 +188,28 @@ class SimpleAgent:
             self.message_history.add_message(Message.user_message(task))
 
         try:
-            # Phase 1: 尝试直接响应（不经过 Planner）
-            direct = self._try_direct_response()
-            if direct is not None:
-                final_result = direct
+            # 统一由 Planner 判断：直接回答 or 制定计划
+            self.logger.info("\n正在分析任务...")
+            recent_history = self._get_recent_history_summary()
+            plan_or_answer = self.planner.create_plan(task, context=recent_history)
+
+            # Planner 判断可以直接回答（闲聊、回忆等不需要工具的场景）
+            if isinstance(plan_or_answer, str):
+                final_result = plan_or_answer
             else:
-                # Phase 2: LLM 需要工具 → 进入规划流程
-                self.logger.info("\n正在制定执行计划...")
-                recent_history = self._get_recent_history_summary()
-                plan_or_answer = self.planner.create_plan(task, context=recent_history)
+                plan = plan_or_answer
 
-                # Planner 也可能判断可以直接回答（二次兜底）
-                if isinstance(plan_or_answer, str):
-                    final_result = plan_or_answer
+                # 显示计划并询问用户确认
+                print("\n" + str(plan))
+                confirm = input("\n是否执行此计划？(y/n，直接回车表示确认): ").strip().lower()
+
+                if confirm and confirm != 'y':
+                    self.logger.info("用户取消执行")
+                    final_result = "任务已取消"
                 else:
-                    plan = plan_or_answer
-
-                    # 显示计划并询问用户确认
-                    print("\n" + str(plan))
-                    confirm = input("\n是否执行此计划？(y/n，直接回车表示确认): ").strip().lower()
-
-                    if confirm and confirm != 'y':
-                        self.logger.info("用户取消执行")
-                        final_result = "任务已取消"
-                    else:
-                        # 执行计划
-                        result = self.plan_executor.execute_plan(plan)
-
-                        if result["success"]:
-                            final_result = result["final_result"]
-                        else:
-                            final_result = f"计划执行失败: {result.get('error', '未知错误')}"
+                    # 执行计划
+                    result = self.plan_executor.execute_plan(plan)
+                    final_result = result["final_result"] or f"计划执行失败: {result.get('error', '未知错误')}"
 
         except Exception as e:
             self.logger.error(f"规划模式执行失败: {str(e)}")
@@ -356,7 +355,9 @@ class SimpleAgent:
         final_result = self._get_final_result()
 
         # 持久化模式: 检查是否需要整合记忆，然后保存会话
-        if self.use_persistence:
+        # 子任务模式下跳过（由主任务统一处理）
+        is_subtask = getattr(self, '_is_subtask', False)
+        if self.use_persistence and not is_subtask:
             self._maybe_consolidate()
             self.session_manager.save(self.session)
 
@@ -370,6 +371,10 @@ class SimpleAgent:
         """
         执行子任务（用于计划执行器调用）
 
+        子任务模式下：
+        - 不注入 runtime context（防止 LLM 回复时间信息而非工具结果）
+        - 不触发记忆整合（避免无意义的开销）
+
         参数:
             task: 子任务描述
             max_steps: 最大执行步数
@@ -381,6 +386,7 @@ class SimpleAgent:
         original_max_steps = self.max_steps
         self.max_steps = max_steps
         self._allowed_tools = allowed_tools
+        self._is_subtask = True
 
         try:
             result = self._run_without_planning(task)
@@ -388,6 +394,7 @@ class SimpleAgent:
         finally:
             self.max_steps = original_max_steps
             self._allowed_tools = None
+            self._is_subtask = False
 
     def _think_and_act(self) -> bool:
         """
@@ -399,14 +406,22 @@ class SimpleAgent:
         try:
             # 获取消息列表
             if self.use_persistence:
-                # 从 session key 解析渠道信息，如 "cli:direct" → channel="cli", chat_id="direct"
-                channel, _, chat_id = self.session.key.partition(":")
-                messages = self.context_builder.build_messages(
-                    session=self.session,
-                    base_system_prompt=self.base_system_prompt,
-                    channel=channel or None,
-                    chat_id=chat_id or None,
-                )
+                is_subtask = getattr(self, '_is_subtask', False)
+                if is_subtask:
+                    # 子任务模式: 不注入 runtime context，防止 LLM 回复时间信息
+                    messages = self.context_builder.build_messages(
+                        session=self.session,
+                        base_system_prompt=self.base_system_prompt,
+                    )
+                else:
+                    # 正常模式: 注入 runtime context
+                    channel, _, chat_id = self.session.key.partition(":")
+                    messages = self.context_builder.build_messages(
+                        session=self.session,
+                        base_system_prompt=self.base_system_prompt,
+                        channel=channel or None,
+                        chat_id=chat_id or None,
+                    )
             elif self.use_memory_manager:
                 messages = self.memory_manager.get_context_messages()
             else:
@@ -542,6 +557,7 @@ class SimpleAgent:
                 self._add_tool_message(tool_id, tool_name, result_str)
 
             except Exception as e:
+                self._last_tool_had_error = True
                 error_msg = f"工具执行失败: {str(e)}"
                 self.logger.error(f"错误: {error_msg}")
                 self._add_tool_message(tool_id, tool_name, error_msg)

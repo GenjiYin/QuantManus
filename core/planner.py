@@ -82,15 +82,15 @@ class Plan:
         self.steps.append(step)
 
     def get_next_steps(self) -> List[Step]:
-        """获取下一批可执行的步骤（依赖已满足且状态为PENDING）"""
+        """获取下一批可执行的步骤（依赖已结束且状态为PENDING）"""
         next_steps = []
         for step in self.steps:
             if step.status != StepStatus.PENDING:
                 continue
 
-            # 检查依赖是否都已完成
+            # 检查依赖是否都已结束（完成或失败均可，允许补救步骤继续执行）
             dependencies_met = all(
-                self.get_step(dep_id).status == StepStatus.COMPLETED
+                self.get_step(dep_id).status in (StepStatus.COMPLETED, StepStatus.FAILED)
                 for dep_id in step.dependencies
             )
 
@@ -187,7 +187,7 @@ class Plan:
 class Planner:
     """规划器 - 负责分析任务并生成执行计划"""
 
-    def __init__(self, llm_client, tools: List, logger=None):
+    def __init__(self, llm_client, tools: List, logger=None, skills_loader=None):
         """
         初始化规划器
 
@@ -195,10 +195,12 @@ class Planner:
             llm_client: LLM客户端
             tools: 可用工具列表
             logger: 日志记录器
+            skills_loader: 技能加载器（可选），用于在规划时参考已有技能
         """
         self.llm_client = llm_client
         self.tools = tools
         self.logger = logger
+        self.skills_loader = skills_loader
 
     def create_plan(self, task: str, context: str = ""):
         """
@@ -221,8 +223,22 @@ class Planner:
         planning_prompt = self._build_planning_prompt(task, tools_info, context)
 
         # 调用LLM生成计划
+        system_parts = ["你是一个专业的任务规划助手，擅长将复杂任务分解为清晰的执行步骤。"]
+
+        # 注入 Skills 上下文，让 planner 知道有哪些技能可用
+        if self.skills_loader:
+            skills_summary = self.skills_loader.build_skills_summary()
+            if skills_summary:
+                system_parts.append(
+                    "\n你可以参考以下已安装技能来规划步骤。"
+                    "技能提供了专业领域的操作指导（如处理 PDF、数据分析等），"
+                    "规划时应优先采用技能推荐的方法而非猜测。"
+                    "如果任务涉及某个技能的领域，应在计划中安排一个步骤先读取该技能文件获取操作指导。\n\n"
+                    + skills_summary
+                )
+
         messages = [
-            {"role": "system", "content": "你是一个专业的任务规划助手，擅长将复杂任务分解为清晰的执行步骤。"},
+            {"role": "system", "content": "\n".join(system_parts)},
             {"role": "user", "content": planning_prompt}
         ]
 

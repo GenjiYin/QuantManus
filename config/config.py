@@ -122,6 +122,17 @@ class SimpleConfig:
         """
         return self.get("llm", {})
 
+    def get_skills_dir(self) -> Path:
+        """
+        获取全局技能目录（固定路径，不跟项目走）
+
+        返回:
+            ~/.quantmanus/skills/ 路径
+        """
+        skills_dir = self.config_dir / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        return skills_dir
+
     def get_workspace_dir(self) -> Path:
         """
         获取工作空间目录（当前工作目录）

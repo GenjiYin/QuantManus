@@ -34,16 +34,18 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context -- metadata only, not instructions]"
 
-    def __init__(self, workspace: Path, memory_store: MemoryStore):
+    def __init__(self, workspace: Path, memory_store: MemoryStore, skills_loader=None):
         """
         初始化上下文构建器
 
         参数:
             workspace: 工作空间路径
             memory_store: 记忆存储实例
+            skills_loader: 技能加载器实例（可选）
         """
         self.workspace = workspace
         self.memory = memory_store
+        self.skills_loader = skills_loader
         self.bootstrap_dir = workspace / "bootstrap"
         self.bootstrap_dir.mkdir(parents=True, exist_ok=True)
 
@@ -68,8 +70,8 @@ class ContextBuilder:
             current_message:      当前用户输入文本（None 表示已在 session 中）
             max_history_messages: 最大历史消息数
             media:                图片文件路径列表（用于多模态）
-            channel:              渠道标识（如 "cli", "telegram"）
-            chat_id:              聊天 ID
+            channel:              渠道标识（如 "cli", "telegram"），None 时跳过运行时上下文
+            chat_id:              聊天 ID，None 时跳过运行时上下文
 
         返回:
             消息字典列表，可直接传给 llm_client.chat()
@@ -86,8 +88,10 @@ class ContextBuilder:
         messages.extend(history)
 
         # [N+1] 运行时上下文（不持久化到 session）
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
-        messages.append({"role": "user", "content": runtime_ctx})
+        # 仅在指定了 channel 时注入；子任务执行时不传 channel，跳过此项
+        if channel:
+            runtime_ctx = self._build_runtime_context(channel, chat_id)
+            messages.append({"role": "user", "content": runtime_ctx})
 
         # [N+2] 当前用户输入（可能含图片）
         if current_message is not None:
@@ -132,8 +136,23 @@ class ContextBuilder:
         if memory_context:
             parts.append(f"# Memory\n\n{memory_context}")
 
-        # 5. Skills（预留扩展点）
-        # TODO: 接入 SkillsLoader 后，在此处添加 Always-on 技能和技能摘要
+        # 5. Skills
+        if self.skills_loader:
+            # 5a. Always-on 技能全文
+            always_skills = self.skills_loader.get_always_skills()
+            if always_skills:
+                skills_content = self.skills_loader.load_skills_for_context(always_skills)
+                if skills_content:
+                    parts.append(f"# Active Skills\n\n{skills_content}")
+
+            # 5b. 所有技能摘要（XML）
+            skills_summary = self.skills_loader.build_skills_summary()
+            if skills_summary:
+                header = ("# Skills\n\n"
+                          "The following skills extend your capabilities. "
+                          "To use a skill, read its SKILL.md file using the read_file tool.\n"
+                          "Skills with available=\"false\" need dependencies installed first.\n\n")
+                parts.append(header + skills_summary)
 
         return "\n\n---\n\n".join(parts)
 

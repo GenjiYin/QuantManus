@@ -5,6 +5,9 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from .planner import Plan, Step, StepStatus
 
+# 终局反思最多追加的轮数，防止无限循环
+_MAX_FINAL_RECOVERY_ROUNDS = 2
+
 
 class PlanExecutor:
     """计划执行器 - 按步骤执行计划"""
@@ -35,7 +38,6 @@ class PlanExecutor:
         """
         if self.logger:
             self.logger.info(f"开始执行计划: {plan.task}")
-            print(plan)  # 打印完整计划
 
         results = {
             "success": False,
@@ -72,19 +74,48 @@ class PlanExecutor:
                     progress = plan.get_progress()
                     self.logger.info(f"执行进度: {progress['progress']}")
 
+            # 终局反思：如果有失败步骤，尝试补救以完成原始任务
+            if plan.has_failed() and self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
+                recovery_round = 0
+                while recovery_round < _MAX_FINAL_RECOVERY_ROUNDS and plan.has_failed():
+                    recovery_round += 1
+                    if self.logger:
+                        self.logger.info(f"🔄 终局反思第 {recovery_round} 轮：尝试补救失败步骤...")
+
+                    recovery_steps = self._final_recovery(plan)
+                    if not recovery_steps:
+                        break
+
+                    for new_step in recovery_steps:
+                        plan.add_step(new_step)
+                        if self.logger:
+                            self.logger.info(f"📌 补救步骤: {new_step.id} - {new_step.description}")
+
+                    # 执行补救步骤
+                    while True:
+                        next_steps = plan.get_next_steps()
+                        if not next_steps:
+                            break
+                        for step in next_steps:
+                            self._execute_step(step, plan, max_retries)
+                            if step.status == StepStatus.COMPLETED:
+                                results["completed_steps"] += 1
+                            elif step.status == StepStatus.FAILED:
+                                results["failed_steps"] += 1
+
             # 检查最终状态
-            if plan.is_completed() and not plan.has_failed():
+            if not plan.has_failed():
                 results["success"] = True
                 results["final_result"] = self._get_plan_summary(plan)
             else:
                 results["error"] = "计划执行未完全成功"
+                results["final_result"] = self._get_plan_summary(plan)
 
             # 打印最终状态
             if self.logger:
                 print("\n" + "=" * 60)
                 print("计划执行完成")
                 print("=" * 60)
-                print(plan)
 
         except Exception as e:
             results["error"] = f"执行计划时出错: {str(e)}"
@@ -116,34 +147,40 @@ class PlanExecutor:
                 # 构造执行提示
                 execution_prompt = self._build_execution_prompt(step, plan)
 
-                # 使用agent执行（如果步骤指定了工具，只允许使用该工具）
-                allowed_tools = [step.tool_name] if step.tool_name else None
+                # 使用agent执行（不限制工具，让 LLM 自主选择最合适的工具）
                 result = self.agent.execute_subtask(
                     task=execution_prompt,
                     max_steps=5,
-                    allowed_tools=allowed_tools
+                    allowed_tools=None
                 )
 
-                # 记录结果
+                # 记录结果，根据工具执行情况判断步骤是否真正成功
                 step.result = result
-                step.status = StepStatus.COMPLETED
                 step.end_time = datetime.now()
+                tool_had_error = getattr(self.agent, '_last_tool_had_error', False)
 
-                if self.logger:
-                    print(f"✅ 步骤 {step.id} 执行成功")
-                    result_preview = result[:200] + "..." if len(result) > 200 else result
-                    print(f"结果: {result_preview}")
+                if tool_had_error:
+                    step.status = StepStatus.FAILED
+                    step.error = "工具执行报错"
+                    if self.logger:
+                        print(f"⚠️ 步骤 {step.id} 工具执行遇到错误")
+                        result_preview = result[:200] + "..." if len(result) > 200 else result
+                        print(f"结果: {result_preview}")
+                else:
+                    step.status = StepStatus.COMPLETED
+                    if self.logger:
+                        print(f"✅ 步骤 {step.id} 执行成功")
+                        result_preview = result[:200] + "..." if len(result) > 200 else result
+                        print(f"结果: {result_preview}")
 
-                # 反思机制：仅在工具执行实际报错时才触发
-                if self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
-                    if getattr(self.agent, '_last_tool_had_error', False):
-                        new_steps = self.agent.planner.reflect_and_adjust_plan(plan, step)
-                        if new_steps:
-                            # 将新步骤插入到计划中
-                            for new_step in new_steps:
-                                plan.add_step(new_step)
-                                if self.logger:
-                                    self.logger.info(f"📌 已添加新步骤: {new_step.id} - {new_step.description}")
+                # 反思机制：工具报错时触发，尝试动态补救
+                if tool_had_error and self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
+                    new_steps = self.agent.planner.reflect_and_adjust_plan(plan, step)
+                    if new_steps:
+                        for new_step in new_steps:
+                            plan.add_step(new_step)
+                            if self.logger:
+                                self.logger.info(f"📌 已添加新步骤: {new_step.id} - {new_step.description}")
 
                 break  # 成功则退出重试循环
 
@@ -216,3 +253,99 @@ class PlanExecutor:
                 summary_parts.append(f"   {result_preview}")
 
         return "\n".join(summary_parts)
+
+    def _final_recovery(self, plan: Plan) -> List[Step]:
+        """
+        终局反思：评估原始任务是否已完成，若未完成则生成补救步骤
+
+        与步骤级反思不同，这里关注的是整体任务目标。
+        例如: pip install 成功了，但还没有回去用安装好的库读 PDF。
+
+        Returns:
+            List[Step]: 需要追加的补救步骤，无需补救则返回空列表
+        """
+        planner = self.agent.planner
+
+        # 收集所有步骤的执行摘要
+        steps_summary = []
+        for s in plan.steps:
+            status = "成功" if s.status == StepStatus.COMPLETED else "失败"
+            result_preview = (s.result[:300] + "...") if s.result and len(s.result) > 300 else (s.result or "无")
+            steps_summary.append(
+                f"- 步骤{s.id} [{status}]: {s.description}\n  结果: {result_preview}"
+            )
+
+        tools_info = planner._get_tools_info()
+        next_step_id = max(s.id for s in plan.steps) + 1
+
+        prompt = f"""请判断原始任务是否已通过已执行的步骤完成。
+
+原始任务：
+{plan.task}
+
+已执行步骤及结果：
+{chr(10).join(steps_summary)}
+
+可用工具：
+{tools_info}
+
+判断规则：
+- 如果原始任务的最终目标已经达成（如用户要求的总结、数据、文件等已经产出），返回空步骤。
+- 如果最终目标未达成（如只完成了准备工作但没有执行核心操作），请生成必要的补救步骤来完成任务。
+- 补救步骤应直接针对未完成的核心操作，不要重复已成功的步骤。
+
+请按以下JSON格式输出（只输出JSON，不要其他内容）：
+
+```json
+{{
+  "task_completed": false,
+  "reason": "原因说明",
+  "new_steps": [
+    {{
+      "description": "补救步骤描述",
+      "goal": "步骤目标",
+      "tool_name": "工具名称（可选）",
+      "dependencies": []
+    }}
+  ]
+}}
+```
+
+如果任务已完成：
+```json
+{{
+  "task_completed": true,
+  "reason": "任务已完成的说明",
+  "new_steps": []
+}}
+```"""
+
+        try:
+            messages = [
+                {"role": "system", "content": "你是一个专业的任务规划助手，擅长评估任务完成度并制定补救方案。"},
+                {"role": "user", "content": prompt}
+            ]
+            response = planner.llm_client.chat(messages=messages)
+            result = planner._parse_reflection_response(response.get("content", ""))
+
+            if result.get("task_completed", True):
+                return []
+
+            new_steps = []
+            for i, step_data in enumerate(result.get("new_steps", [])):
+                step = Step(
+                    id=next_step_id + i,
+                    description=step_data["description"],
+                    goal=step_data.get("goal", step_data["description"]),
+                    tool_name=step_data.get("tool_name"),
+                    tool_args=step_data.get("tool_args"),
+                    dependencies=step_data.get("dependencies", [])
+                )
+                new_steps.append(step)
+
+            return new_steps
+
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"终局反思出错: {e}")
+            return []

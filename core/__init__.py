@@ -10,6 +10,7 @@ from .memory_manager import MemoryManager, MemoryItem, TokenCounter
 from .session import Session, SessionManager
 from .memory_store import MemoryStore
 from .context_builder import ContextBuilder
+from .skills_loader import SkillsLoader
 from .planner import Planner, Plan, Step, StepStatus
 from .plan_executor import PlanExecutor
 
@@ -27,6 +28,7 @@ __all__ = [
     'SessionManager',
     'MemoryStore',
     'ContextBuilder',
+    'SkillsLoader',
     'Planner',
     'Plan',
     'Step',
