@@ -74,13 +74,15 @@ class PlanExecutor:
                     progress = plan.get_progress()
                     self.logger.info(f"执行进度: {progress['progress']}")
 
-            # 终局反思：如果有失败步骤，尝试补救以完成原始任务
-            if plan.has_failed() and self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
+            # 终局反思：检查原始任务是否已通过已执行步骤完成
+            # 无论步骤全部成功还是部分失败都需要检查，
+            # 因为"准备工作全部成功但核心操作尚未执行"也需要追加步骤
+            if self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
                 recovery_round = 0
-                while recovery_round < _MAX_FINAL_RECOVERY_ROUNDS and plan.has_failed():
+                while recovery_round < _MAX_FINAL_RECOVERY_ROUNDS:
                     recovery_round += 1
                     if self.logger:
-                        self.logger.info(f"🔄 终局反思第 {recovery_round} 轮：尝试补救失败步骤...")
+                        self.logger.info(f"🔄 终局反思第 {recovery_round} 轮：检查任务是否已完成...")
 
                     recovery_steps = self._final_recovery(plan)
                     if not recovery_steps:
@@ -89,9 +91,9 @@ class PlanExecutor:
                     for new_step in recovery_steps:
                         plan.add_step(new_step)
                         if self.logger:
-                            self.logger.info(f"📌 补救步骤: {new_step.id} - {new_step.description}")
+                            self.logger.info(f"📌 追加步骤: {new_step.id} - {new_step.description}")
 
-                    # 执行补救步骤
+                    # 执行追加步骤
                     while True:
                         next_steps = plan.get_next_steps()
                         if not next_steps:
@@ -164,14 +166,10 @@ class PlanExecutor:
                     step.error = "工具执行报错"
                     if self.logger:
                         print(f"⚠️ 步骤 {step.id} 工具执行遇到错误")
-                        result_preview = result[:200] + "..." if len(result) > 200 else result
-                        print(f"结果: {result_preview}")
                 else:
                     step.status = StepStatus.COMPLETED
                     if self.logger:
                         print(f"✅ 步骤 {step.id} 执行成功")
-                        result_preview = result[:200] + "..." if len(result) > 200 else result
-                        print(f"结果: {result_preview}")
 
                 # 反思机制：工具报错时触发，尝试动态补救
                 if tool_had_error and self.enable_dynamic_planning and hasattr(self.agent, 'planner'):
@@ -219,7 +217,7 @@ class PlanExecutor:
             for dep_id in step.dependencies:
                 dep_step = plan.get_step(dep_id)
                 if dep_step and dep_step.result:
-                    prompt_parts.append(f"- 步骤{dep_id}的结果: {dep_step.result[:200]}")
+                    prompt_parts.append(f"- 步骤{dep_id}的结果: {dep_step.result[:2000]}")
 
         # 如果指定了工具，添加提示
         if step.tool_name:
@@ -239,7 +237,16 @@ class PlanExecutor:
         return "\n".join(prompt_parts)
 
     def _get_plan_summary(self, plan: Plan) -> str:
-        """获取计划执行总结"""
+        """获取计划执行总结
+
+        注意：此结果会存入 session 供后续对话引用，不做截断以保留完整数据。
+        显示层（main.py）如有需要可自行截断。
+        """
+        # 如果只有一个步骤且成功，直接返回该步骤的结果（避免冗余包装）
+        completed = [s for s in plan.steps if s.status == StepStatus.COMPLETED and s.result]
+        if len(plan.steps) == 1 and len(completed) == 1:
+            return completed[0].result
+
         summary_parts = [
             f"任务: {plan.task}",
             f"\n执行结果:",
@@ -249,8 +256,7 @@ class PlanExecutor:
             status_symbol = "✅" if step.status == StepStatus.COMPLETED else "❌"
             summary_parts.append(f"\n{status_symbol} 步骤{step.id}: {step.description}")
             if step.result:
-                result_preview = step.result[:150] + "..." if len(step.result) > 150 else step.result
-                summary_parts.append(f"   {result_preview}")
+                summary_parts.append(f"   {step.result}")
 
         return "\n".join(summary_parts)
 
@@ -270,7 +276,7 @@ class PlanExecutor:
         steps_summary = []
         for s in plan.steps:
             status = "成功" if s.status == StepStatus.COMPLETED else "失败"
-            result_preview = (s.result[:300] + "...") if s.result and len(s.result) > 300 else (s.result or "无")
+            result_preview = (s.result[:2000] + "...") if s.result and len(s.result) > 2000 else (s.result or "无")
             steps_summary.append(
                 f"- 步骤{s.id} [{status}]: {s.description}\n  结果: {result_preview}"
             )

@@ -89,10 +89,13 @@ class Plan:
                 continue
 
             # 检查依赖是否都已结束（完成或失败均可，允许补救步骤继续执行）
-            dependencies_met = all(
-                self.get_step(dep_id).status in (StepStatus.COMPLETED, StepStatus.FAILED)
-                for dep_id in step.dependencies
-            )
+            # 如果依赖ID指向不存在的步骤，视为已满足（不阻塞）
+            dependencies_met = True
+            for dep_id in step.dependencies:
+                dep_step = self.get_step(dep_id)
+                if dep_step is not None and dep_step.status not in (StepStatus.COMPLETED, StepStatus.FAILED):
+                    dependencies_met = False
+                    break
 
             if dependencies_met:
                 next_steps.append(step)
@@ -227,13 +230,27 @@ class Planner:
 
         # 注入 Skills 上下文，让 planner 知道有哪些技能可用
         if self.skills_loader:
+            # always 技能：注入完整内容，让 planner 直接参考其推荐的工具和方法
+            always_skills = self.skills_loader.get_always_skills()
+            if always_skills:
+                skills_content = self.skills_loader.load_skills_for_context(always_skills)
+                if skills_content:
+                    system_parts.append(
+                        "\n以下是始终生效的技能详细内容，规划时请直接参考其中推荐的工具和方法，"
+                        "不需要再安排读取这些技能文件的步骤：\n\n"
+                        + skills_content
+                    )
+
+            # 所有技能摘要：非 always 技能需要先读取技能文件
             skills_summary = self.skills_loader.build_skills_summary()
             if skills_summary:
                 system_parts.append(
                     "\n你可以参考以下已安装技能来规划步骤。"
                     "技能提供了专业领域的操作指导（如处理 PDF、数据分析等），"
-                    "规划时应优先采用技能推荐的方法而非猜测。"
-                    "如果任务涉及某个技能的领域，应在计划中安排一个步骤先读取该技能文件获取操作指导。\n\n"
+                    "规划时必须优先采用技能推荐的工具和方法，而非自行猜测。"
+                    "如果任务涉及某个技能的领域且该技能内容尚未在上方提供，"
+                    "必须在计划中安排一个步骤先用 read_file 读取该技能文件获取操作指导，"
+                    "后续步骤的工具选择应基于技能文件中的推荐方案。\n\n"
                     + skills_summary
                 )
 
@@ -347,15 +364,14 @@ class Planner:
 只输出JSON，不要其他内容。
 
 规划原则（仅当需要工具时适用）：
-1. 将复杂任务分解为简单、可执行的步骤
-2. 每个步骤应该有明确的目标和预期结果
-3. 合理设置步骤之间的依赖关系
-4. 如果某个步骤需要使用特定工具，请指定tool_name
-5. 步骤数量适中（通常1-5个步骤）
+1. 每个步骤只做一件事，对应一个工具调用。不要在一个步骤中混合多个操作（如"读取文件并写入结果"应拆为两步）
+2. 每个步骤必须指定 tool_name，从可用工具列表中选择最合适的工具
+3. 工具选择原则：读取文件用 read_file，写入/创建文件用 write_file，列出目录用 list_directory，需要运行代码处理数据时用 execute_python
+4. 每个步骤应该有明确的目标和预期结果
+5. 合理设置步骤之间的依赖关系
 6. 步骤应该按逻辑顺序排列
 
 严格约束（必须遵守）：
-- 每个操作只能出现一次，禁止重复步骤（例如不能有两个"执行代码"步骤）
 - 只规划用户明确要求的内容，不要添加用户未要求的额外步骤（如"优化"、"重构"、"改进"、"清理"等）
 - 不要添加"验证"或"测试"步骤，除非用户明确要求测试
 - 保持计划精简，完成用户的请求即可，不要画蛇添足"""

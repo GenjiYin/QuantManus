@@ -242,10 +242,8 @@ def main():
                 # 执行任务
                 result = agent.run(task)
 
-                # 打印结果
-                print("\n" + "-" * 60)
-                print(f"最终结果: {result}")
-                print("-" * 60 + "\n")
+                # 打印结果（plan_executor 已打印执行进度，此处仅输出最终结果正文）
+                print(f"\n{result}\n")
 
     except KeyboardInterrupt:
         print("\n\n用户中断,程序退出")

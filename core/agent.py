@@ -301,9 +301,9 @@ class SimpleAgent:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role in ("user", "assistant") and content:
-                # 截断过长内容
-                if len(content) > 300:
-                    content = content[:300] + "..."
+                # 截断过长内容（保留足够长度以便引用文件内容等数据）
+                if len(content) > 2000:
+                    content = content[:2000] + "..."
                 pairs.append(f"{role}: {content}")
 
         # 去掉最后一条（当前 task，已在 planning_prompt 里了）
@@ -387,14 +387,22 @@ class SimpleAgent:
         self.max_steps = max_steps
         self._allowed_tools = allowed_tools
         self._is_subtask = True
+        self._subtask_tool_outputs = []
 
         try:
             result = self._run_without_planning(task)
+
+            # 将工具原始输出拼接到结果前面，确保后续步骤能拿到实际数据
+            if self._subtask_tool_outputs:
+                tool_section = "\n\n".join(self._subtask_tool_outputs)
+                result = f"{tool_section}\n\n---\nLLM汇报: {result}"
+
             return result
         finally:
             self.max_steps = original_max_steps
             self._allowed_tools = None
             self._is_subtask = False
+            self._subtask_tool_outputs = []
 
     def _think_and_act(self) -> bool:
         """
@@ -555,6 +563,11 @@ class SimpleAgent:
 
                 result_str = str(result)
                 self._add_tool_message(tool_id, tool_name, result_str)
+
+                # 子任务模式：收集工具原始输出，确保步骤结果包含实际数据
+                if getattr(self, '_is_subtask', False) and hasattr(self, '_subtask_tool_outputs'):
+                    if hasattr(result, 'success') and result.success and hasattr(result, 'output'):
+                        self._subtask_tool_outputs.append(result.output)
 
             except Exception as e:
                 self._last_tool_had_error = True
