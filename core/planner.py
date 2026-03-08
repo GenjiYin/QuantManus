@@ -27,7 +27,8 @@ class Step:
     tool_args: Optional[Dict[str, Any]] = None  # 工具参数
     dependencies: List[int] = field(default_factory=list)  # 依赖的步骤ID
     status: StepStatus = StepStatus.PENDING
-    result: Optional[str] = None  # 执行结果
+    result: Optional[str] = None  # LLM 汇报结果
+    tool_output: Optional[str] = None  # 工具原始输出（独立数据通道，不经过 LLM 截断）
     error: Optional[str] = None  # 错误信息
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -43,6 +44,7 @@ class Step:
             "dependencies": self.dependencies,
             "status": self.status.value,
             "result": self.result,
+            "tool_output": self.tool_output,
             "error": self.error,
             "start_time": self.start_time.isoformat() if self.start_time else None,
             "end_time": self.end_time.isoformat() if self.end_time else None
@@ -60,6 +62,7 @@ class Step:
             dependencies=data.get("dependencies", []),
             status=StepStatus(data.get("status", "pending")),
             result=data.get("result"),
+            tool_output=data.get("tool_output"),
             error=data.get("error")
         )
         if data.get("start_time"):

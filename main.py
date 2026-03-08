@@ -6,7 +6,7 @@ import sys
 import logging
 from pathlib import Path
 
-from core import SimpleAgent, LLMClient, Message, setup_logger
+from core import SimpleAgent, LLMClient, setup_logger
 from tools import ReadFileTool, WriteFileTool, ListDirectoryTool, PythonExecuteTool
 from config.config import global_config
 
@@ -64,18 +64,17 @@ def create_agent() -> SimpleAgent:
     persistence_config = global_config.get("persistence", {})
     workspace = global_config.get_workspace_dir()
 
-    # 创建Agent（使用持久化模式）
+    # 创建Agent
     agent = SimpleAgent(
         name="QuantManus",
         llm_client=llm_client,
         tools=tools,
         system_prompt=system_prompt,
         max_steps=global_config.get_max_steps(),
-        use_persistence=True,
         workspace=workspace,
         session_key=persistence_config.get("session_key", "cli:direct"),
         consolidation_threshold=persistence_config.get("consolidation_threshold", 50),
-        enable_planning=True
+        enable_planning=True,
     )
 
     return agent
@@ -198,36 +197,30 @@ def main():
 
                 # 列出所有会话
                 if task.lower() in ['sessions', '会话']:
-                    if agent.use_persistence:
-                        sessions = agent.session_manager.list_sessions()
-                        if sessions:
-                            print("\n保存的会话:")
+                    sessions = agent.session_manager.list_sessions()
+                    if sessions:
+                        print("\n保存的会话:")
+                        print("-" * 50)
+                        for s in sessions:
+                            print(f"  Key: {s['key']}")
+                            print(f"  更新: {s['updated_at']}")
+                            print(f"  路径: {s['path']}")
                             print("-" * 50)
-                            for s in sessions:
-                                print(f"  Key: {s['key']}")
-                                print(f"  更新: {s['updated_at']}")
-                                print(f"  路径: {s['path']}")
-                                print("-" * 50)
-                        else:
-                            print("暂无保存的会话")
-                        print()
                     else:
-                        print("未启用持久化模式\n")
+                        print("暂无保存的会话")
+                    print()
                     continue
 
                 # 查看长期记忆
                 if task.lower() in ['memory', '记忆']:
-                    if agent.use_persistence:
-                        content = agent.memory_store.read_long_term()
-                        if content:
-                            print("\n长期记忆 (MEMORY.md):")
-                            print("-" * 50)
-                            print(content)
-                            print("-" * 50 + "\n")
-                        else:
-                            print("长期记忆为空（对话足够多后会自动生成）\n")
+                    content = agent.memory_store.read_long_term()
+                    if content:
+                        print("\n长期记忆 (MEMORY.md):")
+                        print("-" * 50)
+                        print(content)
+                        print("-" * 50 + "\n")
                     else:
-                        print("未启用持久化模式\n")
+                        print("长期记忆为空（对话足够多后会自动生成）\n")
                     continue
 
                 # 查看统计信息

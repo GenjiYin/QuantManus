@@ -1,5 +1,10 @@
 """
 计划执行器模块 - 负责按步骤执行计划
+
+数据流设计:
+- step.tool_output: 工具原始输出（独立数据通道，用于步骤间传递和终局反思）
+- step.result: LLM 汇报文本（用于用户展示）
+- 步骤间依赖优先使用 tool_output，保证下游步骤拿到完整数据
 """
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -156,9 +161,17 @@ class PlanExecutor:
                     allowed_tools=None
                 )
 
-                # 记录结果，根据工具执行情况判断步骤是否真正成功
+                # 记录 LLM 汇报结果
                 step.result = result
                 step.end_time = datetime.now()
+
+                # 从独立数据通道提取工具原始输出
+                raw_outputs = getattr(self.agent, '_subtask_tool_outputs', [])
+                if raw_outputs:
+                    step.tool_output = "\n\n".join(raw_outputs)
+                self.agent._subtask_tool_outputs = []  # 读取后清空
+
+                # 根据工具执行情况判断步骤是否真正成功
                 tool_had_error = getattr(self.agent, '_last_tool_had_error', False)
 
                 if tool_had_error:
@@ -193,17 +206,16 @@ class PlanExecutor:
 
                     if self.logger:
                         self.logger.error(f"❌ 步骤 {step.id} 执行失败: {step.error}")
-
-                    # 询问用户是否继续
-                    if self.logger:
-                        print(f"\n步骤 {step.id} 执行失败，是否继续？(y/n)")
-                        # 注：在实际应用中，这里可以实现更复杂的错误处理策略
                 else:
                     if self.logger:
                         self.logger.warning(f"⚠️ 步骤 {step.id} 执行失败，重试 {retry_count}/{max_retries}")
 
     def _build_execution_prompt(self, step: Step, plan: Plan) -> str:
-        """构建步骤执行提示"""
+        """构建步骤执行提示
+
+        依赖步骤的数据优先使用 tool_output（工具原始输出），
+        保证下游步骤拿到完整数据而非 LLM 摘要。
+        """
         prompt_parts = [
             f"你现在只需要执行下面这一个步骤，完成后立即汇报结果并停止。",
             f"",
@@ -211,13 +223,16 @@ class PlanExecutor:
             f"目标: {step.goal}",
         ]
 
-        # 添加依赖步骤的结果作为上下文
+        # 添加依赖步骤的结果作为上下文（优先使用工具原始输出）
         if step.dependencies:
             prompt_parts.append("\n依赖步骤的结果：")
             for dep_id in step.dependencies:
                 dep_step = plan.get_step(dep_id)
-                if dep_step and dep_step.result:
-                    prompt_parts.append(f"- 步骤{dep_id}的结果: {dep_step.result[:2000]}")
+                if dep_step:
+                    # 优先使用工具原始输出（完整数据），回退到 LLM 汇报
+                    dep_data = dep_step.tool_output or dep_step.result
+                    if dep_data:
+                        prompt_parts.append(f"- 步骤{dep_id}的结果:\n{dep_data}")
 
         # 如果指定了工具，添加提示
         if step.tool_name:
@@ -239,14 +254,17 @@ class PlanExecutor:
     def _get_plan_summary(self, plan: Plan) -> str:
         """获取计划执行总结
 
-        注意：此结果会存入 session 供后续对话引用，不做截断以保留完整数据。
-        显示层（main.py）如有需要可自行截断。
+        对于单步骤计划，返回工具原始输出（如文件内容），避免冗余包装。
+        对于多步骤计划，返回各步骤的 LLM 汇报。
+        此结果会存入 session 供后续对话引用。
         """
-        # 如果只有一个步骤且成功，直接返回该步骤的结果（避免冗余包装）
-        completed = [s for s in plan.steps if s.status == StepStatus.COMPLETED and s.result]
+        # 单步骤且成功：直接返回原始数据
+        completed = [s for s in plan.steps if s.status == StepStatus.COMPLETED]
         if len(plan.steps) == 1 and len(completed) == 1:
-            return completed[0].result
+            step = completed[0]
+            return step.tool_output or step.result or "任务已完成"
 
+        # 多步骤：组合各步骤的结果
         summary_parts = [
             f"任务: {plan.task}",
             f"\n执行结果:",
@@ -264,21 +282,22 @@ class PlanExecutor:
         """
         终局反思：评估原始任务是否已完成，若未完成则生成补救步骤
 
-        与步骤级反思不同，这里关注的是整体任务目标。
-        例如: pip install 成功了，但还没有回去用安装好的库读 PDF。
+        使用工具原始输出（tool_output）做决策，确保 LLM 能看到完整数据。
 
         Returns:
             List[Step]: 需要追加的补救步骤，无需补救则返回空列表
         """
         planner = self.agent.planner
 
-        # 收集所有步骤的执行摘要
+        # 收集所有步骤的执行摘要（优先使用工具原始输出）
         steps_summary = []
         for s in plan.steps:
             status = "成功" if s.status == StepStatus.COMPLETED else "失败"
-            result_preview = (s.result[:2000] + "...") if s.result and len(s.result) > 2000 else (s.result or "无")
+            # 优先使用 tool_output（完整数据），回退到 result（LLM 汇报）
+            data = s.tool_output or s.result or "无"
+            data_preview = (data[:2000] + "...") if len(data) > 2000 else data
             steps_summary.append(
-                f"- 步骤{s.id} [{status}]: {s.description}\n  结果: {result_preview}"
+                f"- 步骤{s.id} [{status}]: {s.description}\n  结果: {data_preview}"
             )
 
         tools_info = planner._get_tools_info()
